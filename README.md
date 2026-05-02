@@ -1,4 +1,4 @@
-# Sublime AI MCP
+# Sublime AI Bridge
 
 An MCP (Model Context Protocol) server, hosted *inside* Sublime Text as a
 plugin, that lets an LLM read and edit code through Sublime's own APIs —
