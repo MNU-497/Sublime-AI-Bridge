@@ -30,8 +30,6 @@ Sublime's status bar.
 |---|---|
 | `get_file_content(project_file, start_line_number, stop_line_number?)` | Read a line-range slice of a file from disk. 1-indexed, inclusive. Omit `stop_line_number` to read through end-of-file. |
 | `set_file_content(project_file, content, start_line_number, stop_line_number?, save?)` | Replace a contiguous range of lines. Omit `stop_line_number` to replace through end-of-file. Single ST undo entry. |
-| `apply_edits_to_file(file_path, edits, save?)` | Low-level batch edit by row/col regions; one undo entry per call. |
-| `save_open_file(file_path)` | Persist a dirty buffer to disk. |
 
 ### Function / symbol
 
@@ -60,6 +58,7 @@ Sublime's status bar.
 | Tool | What it does |
 |---|---|
 | `get_current_selections()` | Return the active view's cursor/selection state with the file path and 1-indexed line ranges. |
+| `set_current_selection_content()` | Replaces the active view's cursor/selection state with content written by the AI/LLM |
 | `run_sublime_command(command, args?, file_path?)` | Run any Sublime Text command (formatters, sort, custom plugins). Escape hatch. |
 
 ## How it works
@@ -109,9 +108,7 @@ contents of this repo's `plugin/` directory into it. Final layout:
 ```
 Packages/
 └── SublimeAIBridge/
-    ├── .python-version              ← MUST be present (forces ST to load
-    │                                  this plugin under Python 3.8 instead
-    │                                  of the legacy 3.3 default)
+    ├── .python-version
     ├── SublimeAIBridge.py
     ├── SublimeAIBridge.sublime-settings
     ├── mcp_lite/
