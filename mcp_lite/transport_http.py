@@ -10,6 +10,7 @@ import json
 import socket
 import sys
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .jsonrpc import INTERNAL_ERROR, PARSE_ERROR, make_error, make_response
@@ -23,6 +24,7 @@ _SSE_KEEPALIVE_SECONDS = 15.0
 _BENIGN_DISCONNECTS = (
     BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
 )
+_SERVER_SESSION_ID = str(uuid.uuid4())
 
 
 class HTTPTransport:
@@ -118,6 +120,19 @@ def _make_handler(mcp, mount_path, log, stop_event):
                 return True
             return False
 
+        def _allowed_origin(self):
+            origin = self.headers.get("Origin", "")
+            if origin and origin.startswith(_ALLOWED_ORIGIN_PREFIXES):
+                return origin
+            return None
+
+        def _send_cors_headers(self):
+            origin = self._allowed_origin()
+            if origin:
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+                self.send_header("Vary", "Origin")
+
         def _send_json(self, status, payload, session_id=None):
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
@@ -126,8 +141,35 @@ def _make_handler(mcp, mount_path, log, stop_event):
             self.send_header("Cache-Control", "no-store")
             if session_id:
                 self.send_header("Mcp-Session-Id", session_id)
+            self._send_cors_headers()
             self.end_headers()
             self.wfile.write(body)
+
+        # ---- OPTIONS: CORS preflight --------------------------------------
+
+        def do_OPTIONS(self):
+            if self.path != mount_path:
+                self.send_error(404)
+                return
+            origin = self._allowed_origin()
+            if not origin:
+                # No Origin or non-local Origin -- reject preflight by
+                # omitting CORS headers; the browser will surface this as a
+                # "Failed to fetch" with a CORS message.
+                self.send_error(403, "non-local Origin rejected")
+                return
+            requested = self.headers.get(
+                "Access-Control-Request-Headers",
+                "Content-Type, Mcp-Session-Id, Accept, Mcp-Protocol-Version",
+            )
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", requested)
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Vary", "Origin")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         # ---- GET: idle SSE stream -----------------------------------------
 
@@ -147,6 +189,7 @@ def _make_handler(mcp, mount_path, log, stop_event):
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Connection", "keep-alive")
                 self.send_header("X-Accel-Buffering", "no")
+                self._send_cors_headers()
                 # Streamable-HTTP responses are not chunked transfer encoded
                 # by default in stdlib http.server when Content-Length is
                 # omitted under HTTP/1.1; force connection: close semantics
@@ -181,6 +224,7 @@ def _make_handler(mcp, mount_path, log, stop_event):
         def do_DELETE(self):
             self.send_response(204)
             self.send_header("Content-Length", "0")
+            self._send_cors_headers()
             self.end_headers()
 
         # ---- POST: JSON-RPC -----------------------------------------------
@@ -217,6 +261,9 @@ def _make_handler(mcp, mount_path, log, stop_event):
                     session_id=session_id)
                 return
 
+            if isinstance(msg, dict) and msg.get("method") == "initialize":
+                session_id = _SERVER_SESSION_ID
+
             try:
                 response = mcp.handle(msg)
             except Exception as e:
@@ -232,6 +279,7 @@ def _make_handler(mcp, mount_path, log, stop_event):
                 self.send_header("Content-Length", "0")
                 if session_id:
                     self.send_header("Mcp-Session-Id", session_id)
+                self._send_cors_headers()
                 self.end_headers()
                 return
 
