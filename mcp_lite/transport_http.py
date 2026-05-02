@@ -1,0 +1,240 @@
+"""Streamable-HTTP transport for the MCP server.
+
+Bound to localhost. POST /mcp accepts a JSON-RPC request and returns the
+JSON-RPC response. GET /mcp opens a server-sent-events stream that we keep
+alive but never push notifications on -- this server is tool-only, so the
+stream just exists to satisfy clients that expect the channel. DELETE /mcp
+is accepted as a no-op since we're stateless.
+"""
+import json
+import socket
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .jsonrpc import INTERNAL_ERROR, PARSE_ERROR, make_error, make_response
+
+
+_ALLOWED_ORIGIN_PREFIXES = (
+    "http://localhost", "http://127.0.0.1",
+    "https://localhost", "https://127.0.0.1",
+)
+_SSE_KEEPALIVE_SECONDS = 15.0
+_BENIGN_DISCONNECTS = (
+    BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+)
+
+
+class HTTPTransport:
+    def __init__(self, mcp, host="127.0.0.1", port=8765, path="/mcp", logger=None):
+        self._mcp = mcp
+        self.host = host
+        self.port = int(port)
+        self.path = path
+        self._log = logger or (lambda *a, **kw: None)
+        self._httpd = None
+        self._thread = None
+        self._stop_event = threading.Event()
+
+    @property
+    def bound_port(self):
+        if self._httpd is None:
+            return None
+        return self._httpd.server_address[1]
+
+    def start(self):
+        self._stop_event.clear()
+        handler_cls = _make_handler(
+            self._mcp, self.path, self._log, self._stop_event,
+        )
+        server_cls = _make_server(self._log)
+        self._httpd = server_cls((self.host, self.port), handler_cls)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever,
+            name="mcp-http",
+            daemon=True,
+        )
+        self._thread.start()
+        self._log("MCP HTTP transport listening on %s:%d%s",
+                  self.host, self.bound_port, self.path)
+
+    def stop(self, timeout=2.0):
+        # Wake up any in-flight SSE keepalive loops so they exit cleanly.
+        self._stop_event.set()
+        if self._httpd is not None:
+            try:
+                self._httpd.shutdown()
+            except Exception:
+                pass
+            try:
+                self._httpd.server_close()
+            except Exception:
+                pass
+            self._httpd = None
+        if self._thread is not None:
+            self._thread.join(timeout)
+            if self._thread.is_alive():
+                self._log("MCP HTTP thread did not exit within %.1fs", timeout)
+            self._thread = None
+
+
+def _make_server(log):
+    class _Server(ThreadingHTTPServer):
+        # SSE handlers block until the client disconnects; non-daemon threads
+        # would prevent the server from shutting down cleanly on plugin reload.
+        daemon_threads = True
+        allow_reuse_address = True
+
+        def handle_error(self, request, client_address):
+            exc = sys.exc_info()[1]
+            if isinstance(exc, _BENIGN_DISCONNECTS) or isinstance(exc, OSError):
+                # Clients drop the SSE channel routinely; not worth a stack trace.
+                return
+            try:
+                log("server error from %s: %r", client_address, exc)
+            except Exception:
+                pass
+
+    return _Server
+
+
+def _make_handler(mcp, mount_path, log, stop_event):
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, format, *args):
+            return
+
+        def log_error(self, format, *args):
+            try:
+                log("http error: " + (format % args))
+            except Exception:
+                pass
+
+        def _reject_non_local(self):
+            origin = self.headers.get("Origin", "")
+            if origin and not origin.startswith(_ALLOWED_ORIGIN_PREFIXES):
+                self.send_error(403, "non-local Origin rejected")
+                return True
+            return False
+
+        def _send_json(self, status, payload, session_id=None):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            if session_id:
+                self.send_header("Mcp-Session-Id", session_id)
+            self.end_headers()
+            self.wfile.write(body)
+
+        # ---- GET: idle SSE stream -----------------------------------------
+
+        def do_GET(self):
+            if self.path != mount_path:
+                self.send_error(404)
+                return
+            if self._reject_non_local():
+                return
+
+            # Open the SSE stream. We never emit JSON-RPC frames on it (this
+            # server has no notifications to push), but holding the channel
+            # open is what most Streamable-HTTP clients expect.
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                # Streamable-HTTP responses are not chunked transfer encoded
+                # by default in stdlib http.server when Content-Length is
+                # omitted under HTTP/1.1; force connection: close semantics
+                # by switching protocol back to 1.0 for this response.
+                self.protocol_version = "HTTP/1.0"
+                self.end_headers()
+                self.wfile.write(b": stream open\n\n")
+                self.wfile.flush()
+            except _BENIGN_DISCONNECTS:
+                return
+            except OSError as e:
+                log("sse open failed: %s", e)
+                return
+
+            # Keepalive loop. wait() returns True when stop_event is set,
+            # which happens on plugin_unloaded.
+            try:
+                while not stop_event.wait(_SSE_KEEPALIVE_SECONDS):
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    except _BENIGN_DISCONNECTS:
+                        return
+                    except OSError:
+                        return
+            finally:
+                try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
+
+        def do_DELETE(self):
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        # ---- POST: JSON-RPC -----------------------------------------------
+
+        def do_POST(self):
+            if self.path != mount_path:
+                self.send_error(404)
+                return
+            if self._reject_non_local():
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.send_error(400, "bad Content-Length")
+                return
+            if length <= 0:
+                self.send_error(400, "empty body")
+                return
+
+            try:
+                raw = self.rfile.read(length)
+            except (ConnectionError, socket.timeout) as e:
+                log("read body failed: %s", e)
+                return
+
+            session_id = self.headers.get("Mcp-Session-Id")
+
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                self._send_json(200, make_response(None, error=make_error(
+                    PARSE_ERROR, "parse error: {}".format(e))),
+                    session_id=session_id)
+                return
+
+            try:
+                response = mcp.handle(msg)
+            except Exception as e:
+                log("dispatch crashed: %s", e)
+                req_id = msg.get("id") if isinstance(msg, dict) else None
+                self._send_json(200, make_response(req_id, error=make_error(
+                    INTERNAL_ERROR, "internal error: {}".format(e))),
+                    session_id=session_id)
+                return
+
+            if response is None:
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                if session_id:
+                    self.send_header("Mcp-Session-Id", session_id)
+                self.end_headers()
+                return
+
+            self._send_json(200, response, session_id=session_id)
+
+    return _Handler

@@ -1,0 +1,12 @@
+{
+    // Host to bind the MCP HTTP server to. Localhost only by default; the
+    // server rejects requests with non-localhost Origin headers regardless.
+    "host": "127.0.0.1",
+
+    // Preferred port. If busy, the plugin walks the next 9 ports until one
+    // binds. The actually-bound port is written to:
+    //     <Cache>/SublimeAIBridge.port
+    // so the MCP client config can pick it up. Use the
+    // "SublimeAIBridge: Show Port" command to see the current URL.
+    "port": 8765
+}
