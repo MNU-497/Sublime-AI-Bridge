@@ -346,27 +346,6 @@ You called `set_function_content` (or sibling) with `save=false` (the
 default) on a file that was already open in Sublime. Either save in ST
 manually, call `save_open_file`, or pass `save=true` to the edit call.
 
-## Project layout
-
-```
-sublime-ai-mcp/
-├── README.md                 # this file
-├── LICENSE                   # MIT
-└── plugin/                   # mirror of Packages/SublimeAIBridge/
-    ├── .python-version       # forces ST 3.8 plugin runtime
-    ├── SublimeAIBridge.py    # plugin entry: lifecycle + TextCommand
-    ├── SublimeAIBridge.sublime-settings
-    ├── mcp_lite/             # stdlib-only MCP protocol implementation
-    │   ├── __init__.py
-    │   ├── jsonrpc.py        # JSON-RPC 2.0 framing
-    │   ├── schema.py         # type-hint → JSON-Schema inputSchema generation
-    │   ├── server.py         # tool registry + dispatch + timeout/cancel
-    │   └── transport_http.py # Streamable-HTTP transport
-    └── tools/
-        ├── __init__.py
-        └── sublime_tools.py  # the 16 tool implementations
-```
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
