@@ -109,7 +109,8 @@ Packages/
 └── SublimeAIBridge/
     ├── .python-version
     ├── SublimeAIBridge.py
-    ├── SublimeAIBridge.sublime-settings
+    ├── Ai Bridge.sublime-settings
+    ├── Main.sublime-menu
     ├── mcp_lite/
     │   ├── __init__.py
     │   ├── jsonrpc.py
@@ -141,7 +142,7 @@ and the command palette entry **SublimeAIBridge: Show Port** displays it.
 
 ## Settings
 
-`SublimeAIBridge.sublime-settings`:
+`Ai Bridge.sublime-settings`:
 
 ```json
 {

@@ -2,7 +2,7 @@
 
 Replaces the previous external-process design. Drop the package into Packages/
 (Preferences > Browse Packages...). On load, it starts a Streamable-HTTP MCP
-server on 127.0.0.1:8765 by default; configure via SublimeAIBridge.sublime-settings.
+server on 127.0.0.1:8765 by default; configure via "Ai Bridge.sublime-settings".
 """
 import os
 import sublime
@@ -56,7 +56,7 @@ def _log(fmt, *args):
 # ---------------------------------------------------------------- port
 
 def _settings():
-    return sublime.load_settings("SublimeAIBridge.sublime-settings")
+    return sublime.load_settings("Ai Bridge.sublime-settings")
 
 
 def _state_path():
