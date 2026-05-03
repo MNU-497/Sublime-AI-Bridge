@@ -96,12 +96,22 @@ def _ensure_view(file_path):
     return view, was_open
 
 
-def _find_body_extent(view, point):
-    candidates = []
+def _scope_regions_for_body(view):
+    """Snapshot every body-scope region in the view.
+
+    One `find_by_selector` call per scope; callers that probe many points in
+    the same view should compute this once and pass it to `_find_body_extent`.
+    """
+    out = []
     for selector in SCOPE_SELECTORS:
-        for r in view.find_by_selector(selector):
-            if r.begin() <= point <= r.end():
-                candidates.append(r)
+        out.extend(view.find_by_selector(selector))
+    return out
+
+
+def _find_body_extent(view, point, _scope_regions=None):
+    if _scope_regions is None:
+        _scope_regions = _scope_regions_for_body(view)
+    candidates = [r for r in _scope_regions if r.begin() <= point <= r.end()]
     if candidates:
         return min(candidates, key=lambda r: r.size())
 
@@ -573,11 +583,21 @@ def get_function_content(file_path: str, name: Optional[str] = None,
         # circuit the indentation-based extraction below.
         candidates = []
         sym_iter = () if is_python else view.symbol_regions()
+        # Snapshot body-scope regions once for the whole loop; without this,
+        # _find_body_extent re-runs 7 find_by_selector calls per symbol.
+        scope_regions = None if is_python else _scope_regions_for_body(view)
         for sr in sym_iter:
             if name is not None and sr.name != name:
                 continue
+            # Cheap pre-filter when `row` is given: a symbol declared AFTER
+            # the target point cannot have a body that brackets it (bodies
+            # extend forward from the declaration). Skipping these saves
+            # an expensive `_find_body_extent` per symbol on large files.
+            if target_point is not None and sr.region.begin() > target_point:
+                continue
             sym_row, sym_col = _rowcol_1based(view, sr.region.begin())
-            extent = _find_body_extent(view, sr.region.begin())
+            extent = _find_body_extent(view, sr.region.begin(),
+                                       _scope_regions=scope_regions)
             if extent is None:
                 continue
             # Row filter: extent must bracket the requested line.

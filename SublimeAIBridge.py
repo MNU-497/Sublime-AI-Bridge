@@ -11,7 +11,8 @@ import threading
 
 from .mcp_lite.server import MCPServer
 from .mcp_lite.transport_http import HTTPTransport
-from .tools.sublime_tools import register_all
+from .tools.sublime_prompts import register_all as register_all_prompts
+from .tools.sublime_tools import register_all as register_all_tools
 
 
 SERVER_NAME = "sublime-ai"
@@ -98,7 +99,8 @@ def plugin_loaded():
         port = int(settings.get("port") or DEFAULT_PORT)
 
         mcp = MCPServer(SERVER_NAME, version=SERVER_VERSION, logger=_log)
-        register_all(mcp)
+        register_all_tools(mcp)
+        register_all_prompts(mcp)
 
         try:
             transport = _bind_with_fallback(mcp, host, port)

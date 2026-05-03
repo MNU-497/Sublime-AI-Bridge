@@ -78,3 +78,20 @@ def build_input_schema(fn):
 def description_from_doc(fn):
     doc = inspect.getdoc(fn) or ""
     return doc.strip()
+
+
+def build_prompt_arguments(fn, arg_descriptions=None):
+    """MCP prompts use a flat [{name, description, required}] list, not JSON Schema."""
+    arg_descriptions = arg_descriptions or {}
+    sig = inspect.signature(fn)
+    out = []
+    for name, param in sig.parameters.items():
+        if name.startswith("_"):
+            continue
+        entry = {"name": name}
+        desc = arg_descriptions.get(name)
+        if desc:
+            entry["description"] = desc
+        entry["required"] = param.default is inspect.Parameter.empty
+        out.append(entry)
+    return out

@@ -58,7 +58,6 @@ Sublime's status bar.
 | Tool | What it does |
 |---|---|
 | `get_current_selections()` | Return the active view's cursor/selection state with the file path and 1-indexed line ranges. |
-| `set_current_selection_content()` | Replaces the active view's cursor/selection state with content written by the AI/LLM |
 | `run_sublime_command(command, args?, file_path?)` | Run any Sublime Text command (formatters, sort, custom plugins). Escape hatch. |
 
 ## How it works
