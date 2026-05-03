@@ -43,7 +43,12 @@ def _fence_lang_from_scope(scope):
 
 
 def _grab_selection():
-    """Return (display_path, fence_lang, selected_text). Raises if no selection."""
+    """Snapshot the active selection.
+
+    Returns a dict: {display, lang, text, start_row, end_row, total_lines}.
+    For multi-region selections the row range spans first-start to last-end.
+    Raises if no selection.
+    """
     def go():
         w = sublime.active_window()
         if w is None:
@@ -67,8 +72,26 @@ def _grab_selection():
         else:
             display = view.name() or "<untitled {}>".format(view.id())
 
-        scope = view.scope_name(regions[0].begin()) if regions else ""
-        return display, _fence_lang_from_scope(scope), text
+        # Span: first region's start row through last region's end row.
+        # Selections that end at column 0 visually highlight through the
+        # previous line, so report that line as the end (matches the
+        # convention in get_current_selections).
+        start_row, _ = view.rowcol(regions[0].begin())
+        end_pt = regions[-1].end()
+        end_row, end_col = view.rowcol(end_pt)
+        if end_col == 0 and end_row > 0:
+            end_row -= 1
+        total_lines = view.rowcol(view.size())[0] + 1
+
+        scope = view.scope_name(regions[0].begin())
+        return {
+            "display": display,
+            "lang": _fence_lang_from_scope(scope),
+            "text": text,
+            "start_row": start_row + 1,
+            "end_row": end_row + 1,
+            "total_lines": total_lines,
+        }
 
     return _on_main(go)
 
@@ -95,12 +118,31 @@ def _grab_cursor_location():
     return _on_main(go)
 
 
-def _format_with_question(question, lang, body_text):
+def _format_header(rows):
+    """Render a list of (label, value) pairs as an aligned block.
+
+    Labels are right-padded so values line up in a column, e.g.:
+        File:     foo.php
+        Function: handleRequest()
+        Lines:    142-187
+    """
+    width = max(len(label) for label, _ in rows) + 1  # +1 for the colon
+    out = []
+    for label, value in rows:
+        prefix = label + ":"
+        pad = " " * (width + 1 - len(prefix))  # +1 = single-space gap
+        out.append("{}{}{}".format(prefix, pad, value))
+    return "\n".join(out)
+
+
+def _format_message(question, header_rows, lang, body_text):
     fence_open = "```" + lang if lang else "```"
     lines = []
     if question:
         lines.append(question.strip())
         lines.append("")
+    lines.append(_format_header(header_rows))
+    lines.append("")
     lines.append(fence_open)
     lines.append(body_text)
     lines.append("```")
@@ -114,10 +156,15 @@ def selection(question: str = "") -> dict:
     fenced with the buffer's syntax. If multiple regions are selected, they
     are concatenated in document order.
     """
-    display, lang, text = _grab_selection()
-    body = _format_with_question(question, lang, text)
+    sel = _grab_selection()
+    header_rows = [
+        ("File", sel["display"]),
+        ("Lines", "{}-{} (of {})".format(
+            sel["start_row"], sel["end_row"], sel["total_lines"])),
+    ]
+    body = _format_message(question, header_rows, sel["lang"], sel["text"])
     return {
-        "description": display,
+        "description": sel["display"],
         "messages": [
             {"role": "user", "content": {"type": "text", "text": body}},
         ],
@@ -145,7 +192,12 @@ def function(question: str = "") -> dict:
     text = m.get("text") or ""
     start, end = m.get("start_row"), m.get("end_row")
 
-    body = _format_with_question(question, lang, text)
+    header_rows = [
+        ("File", file_path),
+        ("Function", "{}()".format(func_name)),
+        ("Lines", "{}-{}".format(start, end)),
+    ]
+    body = _format_message(question, header_rows, lang, text)
     description = "{} · {} (lines {}-{})".format(file_path, func_name, start, end)
     return {
         "description": description,
