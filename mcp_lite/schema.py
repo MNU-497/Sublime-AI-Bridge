@@ -1,6 +1,6 @@
 """Build JSON-Schema for tool inputs from Python type hints.
 
-Supports the subset used by the AIBridge tools: str, int, float, bool,
+Supports the subset used by the AI Bridge tools: str, int, float, bool,
 List[X], Dict[str, Any], Optional[X], Any. ST 4 ships Python 3.8, so callers
 must use typing.Dict / typing.List / typing.Optional rather than PEP 585/604
 syntax.

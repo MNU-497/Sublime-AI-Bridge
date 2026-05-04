@@ -71,7 +71,7 @@ lives inside the plugin, served from a stdlib `http.server` thread:
 LLM client ──MCP / Streamable-HTTP──▶  127.0.0.1:8765/mcp
                                             │
                                             ▼
-                                    AIBridge plugin
+                                    AI Bridge plugin
                                     (mcp_lite + tool dispatch)
                                             │
                                             ▼
@@ -101,15 +101,15 @@ focused, even when ST isn't the foreground app.
 In Sublime Text: `Preferences → Browse Packages...`. This opens
 `%APPDATA%\Sublime Text\Packages\` on Windows.[^1]
 
-Create a folder called `AIBridge` inside it and copy the entire
-contents of this repo's `plugin/` directory into it. Final layout:
+Create a folder called `AI Bridge` inside it and copy the entire
+contents of this repo into it. Final layout:
 
 ```
 Packages/
-└── AIBridge/
+└── AI Bridge/
     ├── .python-version
     ├── AIBridge.py
-    ├── Ai Bridge.sublime-settings
+    ├── AI Bridge.sublime-settings
     ├── Main.sublime-menu
     ├── mcp_lite/
     │   ├── __init__.py
@@ -142,7 +142,7 @@ and the command palette entry **AI Bridge: Show Port** displays it.
 
 ## Settings
 
-`Ai Bridge.sublime-settings`:
+`AI Bridge.sublime-settings`:
 
 ```json
 {
@@ -312,7 +312,7 @@ any `{}`-delimited language.
 **ImportError: No module named 'typing' on plugin load.**
 Sublime Text 4 defaults plugins to Python 3.3 unless a `.python-version`
 file with the literal string `3.8` exists at the package root. Make sure
-that file is present in `Packages/AIBridge/`.
+that file is present in `Packages/AI Bridge/`.
 
 **MCP client doesn't show any `sublime-ai-bridge` tools.**
 1. Verify the plugin is loaded: open ST's console (`` Ctrl+` ``). On
@@ -327,7 +327,7 @@ that file is present in `Packages/AIBridge/`.
 
 **Port already in use on another tool's side.**
 The plugin walks 8765 → 8774 to find a free port. Use the command palette
-**AIBridge: Show Port** to see what got bound, and update your MCP
+**AI Bridge: Show Port** to see what got bound, and update your MCP
 client's URL to match. The bound port is also written to
 `<Cache>/AIBridge.port`.
 

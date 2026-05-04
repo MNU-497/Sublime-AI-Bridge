@@ -1,4 +1,4 @@
-"""User-invoked prompts exposed by the AIBridge MCP server.
+"""User-invoked prompts exposed by the AI Bridge MCP server.
 
 Prompts (unlike tools) are picked by the *user* from a slash-menu in the
 client, and let the server pre-bake editor state -- here, the active view's

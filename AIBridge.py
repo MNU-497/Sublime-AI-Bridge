@@ -2,7 +2,7 @@
 
 Replaces the previous external-process design. Drop the package into Packages/
 (Preferences > Browse Packages...). On load, it starts a Streamable-HTTP MCP
-server on 127.0.0.1:8765 by default; configure via "Ai Bridge.sublime-settings".
+server on 127.0.0.1:8765 by default; configure via "AI Bridge.sublime-settings".
 """
 import os
 import sublime
@@ -15,7 +15,7 @@ from .tools.sublime_prompts import register_all as register_all_prompts
 from .tools.sublime_tools import register_all as register_all_tools
 
 
-SERVER_NAME = "ai-bridge"
+SERVER_NAME = "sublime-ai-bridge"
 SERVER_VERSION = "0.2.0"
 
 DEFAULT_HOST = "127.0.0.1"
@@ -31,6 +31,9 @@ _mcp = None  # type: MCPServer | None
 # ---------------------------------------------------------------- text command
 # Defined at the top level so ST registers it as a TextCommand. The tools
 # package invokes it by name, so this class never imports from tools/.
+#
+# Class names use "AiBridge" (not "AIBridge") on purpose: ST snake-cases
+# command class names, and "AIBridge" would yield "a_i_bridge". Leave this.
 
 class AiBridgeApplyEditsCommand(sublime_plugin.TextCommand):
     """Atomic batch edit. `edits` is a list of {start, end, text} dicts using

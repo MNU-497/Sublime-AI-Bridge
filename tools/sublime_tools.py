@@ -1,4 +1,4 @@
-"""Tool implementations for the AIBridge MCP server.
+"""Tool implementations for the AI Bridge MCP server.
 
 All Sublime API access is marshaled to the main thread via _on_main. The
 search_text_in_project tool checks mcp_lite.server.is_cancelled() inside its
@@ -406,7 +406,7 @@ def set_file_content(project_file: str, content: str,
             nl = buf.find("\n", end_line_start)
             end_pt = nl + 1 if nl != -1 else len(buf)
 
-        view.run_command("sublime_ai_bridge_apply_edits", {
+        view.run_command("ai_bridge_apply_edits", {
             "edits": [{"start": start_pt, "end": end_pt, "text": content}]
         })
 
@@ -788,7 +788,7 @@ def set_function_content(file_path: str, name: str, new_text: str,
     pre_end = list(_rowcol_1based(view, end_pt))
 
     def apply():
-        view.run_command("sublime_ai_bridge_apply_edits", {
+        view.run_command("ai_bridge_apply_edits", {
             "edits": [{"start": start_pt, "end": end_pt, "text": new_text}]
         })
         effective_save = bool(save) or not was_open
@@ -1017,7 +1017,7 @@ def set_current_selection_content(content: str) -> Dict[str, Any]:
 
         name = view.file_name() or view.name() or "<untitled {}>".format(view.id())
 
-        view.run_command("sublime_ai_bridge_apply_edits", {
+        view.run_command("ai_bridge_apply_edits", {
             "edits": [{"start": start_pt, "end": end_pt, "text": content}]
         })
 

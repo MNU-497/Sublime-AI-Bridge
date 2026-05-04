@@ -12,14 +12,14 @@
                 "children":
                 [
                     {
-                        "caption": "Ai Bridge",
+                        "caption": "AI Bridge",
                         "children":
                         [
                             {
                                 "caption": "Settings",
                                 "command": "edit_settings",
                                 "args": {
-                                    "base_file": "${packages}/Ai Bridge/Ai Bridge.sublime-settings",
+                                    "base_file": "${packages}/AI Bridge/AI Bridge.sublime-settings",
                                     "default": "{\n\t$0\n}\n"
                                 }
                             }
