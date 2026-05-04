@@ -1,4 +1,4 @@
-# Sublime AI Bridge
+# AI Bridge
 
 An MCP (Model Context Protocol) server, hosted *inside* Sublime Text as a
 plugin, that lets an LLM read and edit code through Sublime's own APIs —
@@ -71,7 +71,7 @@ lives inside the plugin, served from a stdlib `http.server` thread:
 LLM client ──MCP / Streamable-HTTP──▶  127.0.0.1:8765/mcp
                                             │
                                             ▼
-                                    SublimeAIBridge plugin
+                                    AIBridge plugin
                                     (mcp_lite + tool dispatch)
                                             │
                                             ▼
@@ -101,14 +101,14 @@ focused, even when ST isn't the foreground app.
 In Sublime Text: `Preferences → Browse Packages...`. This opens
 `%APPDATA%\Sublime Text\Packages\` on Windows.[^1]
 
-Create a folder called `SublimeAIBridge` inside it and copy the entire
+Create a folder called `AIBridge` inside it and copy the entire
 contents of this repo's `plugin/` directory into it. Final layout:
 
 ```
 Packages/
-└── SublimeAIBridge/
+└── AIBridge/
     ├── .python-version
-    ├── SublimeAIBridge.py
+    ├── AIBridge.py
     ├── Ai Bridge.sublime-settings
     ├── Main.sublime-menu
     ├── mcp_lite/
@@ -131,12 +131,12 @@ The plugin auto-loads. Open ST's console (`` Ctrl+` ``); on a successful
 load you'll see:
 
 ```
-[SublimeAIBridge] MCP HTTP transport listening on 127.0.0.1:8765/mcp
+[AI Bridge] MCP HTTP transport listening on 127.0.0.1:8765/mcp
 ```
 
 If port 8765 is busy, the plugin walks 8766–8774 looking for a free one.
-The actual bound port is also written to `<Cache>/SublimeAIBridge.port`,
-and the command palette entry **SublimeAIBridge: Show Port** displays it.
+The actual bound port is also written to `<Cache>/AIBridge.port`,
+and the command palette entry **AI Bridge: Show Port** displays it.
 
 [^1]: On macOS: `~/Library/Application Support/Sublime Text/Packages/`. On Linux: `~/.config/sublime-text/Packages/`.
 
@@ -163,7 +163,7 @@ see tools.
 ### Claude Code (CLI or desktop)
 
 ```
-claude mcp add --transport http sublime-ai http://127.0.0.1:8765/mcp
+claude mcp add --transport http sublime-ai-bridge http://127.0.0.1:8765/mcp
 ```
 
 Or edit `%USERPROFILE%\.claude.json` directly:
@@ -171,7 +171,7 @@ Or edit `%USERPROFILE%\.claude.json` directly:
 ```json
 {
   "mcpServers": {
-    "sublime-ai": {
+    "sublime-ai-bridge": {
       "type": "http",
       "url": "http://127.0.0.1:8765/mcp"
     }
@@ -180,7 +180,7 @@ Or edit `%USERPROFILE%\.claude.json` directly:
 ```
 
 Restart Claude Code (close and relaunch — including any background tray
-process). Open a new conversation; the `mcp__sublime-ai__*` tools should
+process). Open a new conversation; the `mcp__sublime-ai-bridge__*` tools should
 appear.
 
 ### Claude Desktop
@@ -193,7 +193,7 @@ stdio bridge form below works on every version (requires
 ```json
 {
   "mcpServers": {
-    "sublime-ai": {
+    "sublime-ai-bridge": {
       "command": "npx",
       "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/mcp"]
     }
@@ -209,7 +209,7 @@ If your build supports native HTTP, this also works:
 ```json
 {
   "mcpServers": {
-    "sublime-ai": {
+    "sublime-ai-bridge": {
       "type": "http",
       "url": "http://127.0.0.1:8765/mcp"
     }
@@ -225,7 +225,7 @@ mcp.json** in the app):
 ```json
 {
   "mcpServers": {
-    "sublime-ai": {
+    "sublime-ai-bridge": {
       "url": "http://127.0.0.1:8765/mcp"
     }
   }
@@ -238,7 +238,7 @@ Toggle the server on in the Program panel.
 
 In a new conversation with any connected client, ask:
 
-> *Use sublime-ai to list folders in the project and find the function
+> *Use sublime-ai-bridge to list folders in the project and find the function
 > definition of [some function name in your project].*
 
 If you get the folder list and a definition location back, the chain is
@@ -312,12 +312,12 @@ any `{}`-delimited language.
 **ImportError: No module named 'typing' on plugin load.**
 Sublime Text 4 defaults plugins to Python 3.3 unless a `.python-version`
 file with the literal string `3.8` exists at the package root. Make sure
-that file is present in `Packages/SublimeAIBridge/`.
+that file is present in `Packages/AIBridge/`.
 
-**MCP client doesn't show any `sublime-ai` tools.**
+**MCP client doesn't show any `sublime-ai-bridge` tools.**
 1. Verify the plugin is loaded: open ST's console (`` Ctrl+` ``). On
    startup you should see
-   `[SublimeAIBridge] MCP HTTP transport listening on 127.0.0.1:8765/mcp`.
+   `[AI Bridge] MCP HTTP transport listening on 127.0.0.1:8765/mcp`.
    Any traceback there is your culprit.
 2. Verify the server is bound: `curl -i http://127.0.0.1:8765/mcp` should
    give an HTTP response (a `200` SSE stream for GET, since the server
@@ -327,9 +327,9 @@ that file is present in `Packages/SublimeAIBridge/`.
 
 **Port already in use on another tool's side.**
 The plugin walks 8765 → 8774 to find a free port. Use the command palette
-**SublimeAIBridge: Show Port** to see what got bound, and update your MCP
+**AIBridge: Show Port** to see what got bound, and update your MCP
 client's URL to match. The bound port is also written to
-`<Cache>/SublimeAIBridge.port`.
+`<Cache>/AIBridge.port`.
 
 **`definition '...' not found` from `set_function_content`.**
 The symbol exists in the index but `view.symbol_regions()` for that file

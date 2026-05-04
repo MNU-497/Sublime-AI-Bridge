@@ -1,4 +1,4 @@
-"""SublimeAIBridge: in-process MCP server hosted inside Sublime Text.
+"""AI Bridge: in-process MCP server hosted inside Sublime Text.
 
 Replaces the previous external-process design. Drop the package into Packages/
 (Preferences > Browse Packages...). On load, it starts a Streamable-HTTP MCP
@@ -15,13 +15,13 @@ from .tools.sublime_prompts import register_all as register_all_prompts
 from .tools.sublime_tools import register_all as register_all_tools
 
 
-SERVER_NAME = "sublime-ai"
+SERVER_NAME = "ai-bridge"
 SERVER_VERSION = "0.2.0"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 PORT_FALLBACK_RANGE = 10  # try DEFAULT_PORT .. DEFAULT_PORT+9 before giving up
-PORT_STATE_FILENAME = "SublimeAIBridge.port"
+PORT_STATE_FILENAME = "AIBridge.port"
 
 _lock = threading.Lock()
 _transport = None  # type: HTTPTransport | None
@@ -32,7 +32,7 @@ _mcp = None  # type: MCPServer | None
 # Defined at the top level so ST registers it as a TextCommand. The tools
 # package invokes it by name, so this class never imports from tools/.
 
-class SublimeAiBridgeApplyEditsCommand(sublime_plugin.TextCommand):
+class AiBridgeApplyEditsCommand(sublime_plugin.TextCommand):
     """Atomic batch edit. `edits` is a list of {start, end, text} dicts using
     absolute character offsets. Edits are applied in reverse order so earlier
     replacements don't shift the offsets of later ones. Whole batch forms a
@@ -50,13 +50,13 @@ def _log(fmt, *args):
         msg = fmt % args if args else fmt
     except Exception:
         msg = "{} {!r}".format(fmt, args)
-    print("[SublimeAIBridge] " + msg)
+    print("[AI Bridge] " + msg)
 
 
 # ---------------------------------------------------------------- port
 
 def _settings():
-    return sublime.load_settings("Ai Bridge.sublime-settings")
+    return sublime.load_settings("AI Bridge.sublime-settings")
 
 
 def _state_path():
@@ -106,14 +106,14 @@ def plugin_loaded():
             transport = _bind_with_fallback(mcp, host, port)
         except Exception as e:
             _log("failed to start MCP server: %s", e)
-            sublime.status_message("SublimeAIBridge: failed to start ({})".format(e))
+            sublime.status_message("AI Bridge: failed to start ({})".format(e))
             mcp.shutdown()
             return
 
         _mcp = mcp
         _transport = transport
         _write_port_state(transport.bound_port)
-        sublime.status_message("SublimeAIBridge: MCP at {}:{}/mcp".format(
+        sublime.status_message("AI Bridge: MCP at {}:{}/mcp".format(
             host, transport.bound_port))
 
 
@@ -138,26 +138,26 @@ def plugin_unloaded():
 
 # ---------------------------------------------------------------- ux commands
 
-class SublimeAiBridgeShowPortCommand(sublime_plugin.WindowCommand):
+class AiBridgeShowPortCommand(sublime_plugin.WindowCommand):
     """Command palette: report the bound MCP port and URL."""
     def is_enabled(self):
         return _transport is not None
 
     def run(self):
         if _transport is None:
-            sublime.message_dialog("SublimeAIBridge is not running.")
+            sublime.message_dialog("AI Bridge is not running.")
             return
         url = "http://{}:{}/mcp".format(_transport.host, _transport.bound_port)
-        sublime.message_dialog("SublimeAIBridge MCP endpoint:\n\n{}".format(url))
+        sublime.message_dialog("AI Bridge MCP endpoint:\n\n{}".format(url))
 
 
-class SublimeAiBridgeRestartCommand(sublime_plugin.WindowCommand):
+class AiBridgeRestartCommand(sublime_plugin.WindowCommand):
     """Command palette: restart the embedded MCP server."""
     def run(self):
         plugin_unloaded()
         plugin_loaded()
         if _transport is not None:
-            sublime.status_message("SublimeAIBridge: restarted on port {}".format(
+            sublime.status_message("AI Bridge: restarted on port {}".format(
                 _transport.bound_port))
         else:
-            sublime.status_message("SublimeAIBridge: restart failed; see console")
+            sublime.status_message("AI Bridge: restart failed; see console")

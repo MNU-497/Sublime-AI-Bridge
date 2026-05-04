@@ -1,4 +1,4 @@
-"""Tool implementations for the SublimeAIBridge MCP server.
+"""Tool implementations for the AIBridge MCP server.
 
 All Sublime API access is marshaled to the main thread via _on_main. The
 search_text_in_project tool checks mcp_lite.server.is_cancelled() inside its
