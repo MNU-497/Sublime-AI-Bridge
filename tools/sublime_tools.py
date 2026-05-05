@@ -719,7 +719,7 @@ def get_function_content(file_path: str, name: Optional[str] = None,
 
 
 def set_function_content(file_path: str, name: str, new_text: str,
-                         save: bool = False, row: Optional[int] = None) -> Dict[str, Any]:
+                         save: bool = True, row: Optional[int] = None) -> Dict[str, Any]:
     """Replace definition `name` in `file_path` with `new_text`.
 
     `new_text` is the COMPLETE replacement (signature + body + closing
@@ -983,17 +983,18 @@ def set_current_selection_content(content: str) -> Dict[str, Any]:
 
     Multi-cursor: only the first (top-most) selection is touched; any other
     cursors are left in place. If the first region is a zero-width cursor,
-    `content` is INSERTED at that point. The edit is one Sublime undo entry
-    and is left in the buffer (not saved to disk); call `save_open_file` or
-    set `save=true` on a different tool to persist it.
+    `content` is INSERTED at that point. The edit is one Sublime undo entry.
+    If after the edit the buffer is dirty AND has a real on-disk file path,
+    the file is saved automatically; otherwise the edit is left unsaved.
 
     Untitled buffers are supported -- `project_file` will be a display name
     like `<untitled 5>`.
 
     Returns: {ok, project_file, replaced_start_line, replaced_stop_line,
-    inserted_length, dirty}. The reported line range is the PRE-edit range of
-    the selection that was replaced (with the same column-0 normalization as
-    `get_current_selections`).
+    inserted_length, dirty, saved}. The reported line range is the PRE-edit
+    range of the selection that was replaced (with the same column-0
+    normalization as `get_current_selections`). `saved` is True if the file
+    was written to disk during this call.
     """
     def go():
         w = sublime.active_window()
@@ -1021,6 +1022,16 @@ def set_current_selection_content(content: str) -> Dict[str, Any]:
             "edits": [{"start": start_pt, "end": end_pt, "text": content}]
         })
 
+        # Persist to disk only if the buffer is dirty AND backed by a real
+        # on-disk file. Untitled buffers (file_name() is None) and views
+        # whose path no longer exists are left dirty for the user to handle.
+        saved = False
+        if view.is_dirty():
+            fpath = view.file_name()
+            if fpath and os.path.isfile(fpath):
+                view.run_command("save")
+                saved = True
+
         return {
             "ok": True,
             "project_file": name,
@@ -1028,6 +1039,7 @@ def set_current_selection_content(content: str) -> Dict[str, Any]:
             "replaced_stop_line": end_row + 1,
             "inserted_length": len(content),
             "dirty": view.is_dirty(),
+            "saved": saved,
         }
 
     return _on_main(go)
@@ -1055,6 +1067,7 @@ def run_sublime_command(command: str, args: Optional[Dict[str, Any]] = None,
       run_sublime_command("goto_line", {"line": 1688}, "/path/to/file")
       run_sublime_command("reindent", {"single_line": false}, "/path/to/file")
       run_sublime_command("revert", file_path="/path/to/file")
+      run_sublime_command("undo", file_path="/path/to/file")
       run_sublime_command("save", file_path="/path/to/file")
       run_sublime_command("set_file_type", {"syntax": "Packages/PHP/PHP.sublime-syntax"}, "/path/to/file")
       run_sublime_command("sort_lines", {"case_sensitive": false}, "/path/to/file")
