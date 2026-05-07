@@ -235,6 +235,60 @@ def _count_lines(buf):
     return buf.count("\n") + 1
 
 
+def _read_selections(view):
+    """Build the selection-state payload for `view`.
+
+    MUST be called on the main thread (it touches view.sel(), view.substr,
+    view.rowcol, view.file_name, etc.). Callers in this module wrap the
+    invocation in `_on_main` so all reads happen atomically on a single
+    main-thread tick.
+
+    Output is the source of truth for both the top-level
+    `get_current_selections` MCP tool and the in-chain pseudo-command of
+    the same name dispatched from `run_sublime_command`. If you change
+    this shape, both paths change at once -- which is the point.
+
+    Sublime always has at least one region (a bare cursor counts as a
+    zero-width selection with empty `text`), so `selections` is always
+    non-empty in practice. Multi-cursor: each cursor is its own entry, in
+    top-to-bottom order.
+
+    Line-end normalization: if a selection ends at column 0 of a line
+    (typical when selecting full lines via shift-down or triple-click),
+    `stop_line_number` reports the PREVIOUS line -- the last line with
+    any character actually highlighted. So selecting visible content of
+    lines 3-5 always returns stop_line_number=5.
+
+    Untitled buffers: `project_file` falls back to a display name like
+    `<untitled 5>` and CANNOT be passed to file-oriented tools.
+    """
+    regions = list(view.sel())
+    if not regions:
+        raise RuntimeError("active view has no selection regions")
+
+    name = view.file_name() or view.name() or "<untitled {}>".format(view.id())
+    project_file_total_lines = _count_lines(view.substr(sublime.Region(0, view.size())))
+
+    def region_to_dict(r):
+        start_row, _ = view.rowcol(r.begin())
+        end_row, end_col = view.rowcol(r.end())
+        # If a non-empty selection ends at column 0, the visible last
+        # highlighted line is the previous one.
+        if not r.empty() and end_col == 0 and end_row > 0:
+            end_row -= 1
+        return {
+            "start_line_number": start_row + 1,
+            "stop_line_number": end_row + 1,
+            "text": view.substr(r),
+        }
+
+    return {
+        "project_file": name,
+        "project_file_total_lines": project_file_total_lines,
+        "selections": [region_to_dict(r) for r in regions],
+    }
+
+
 def _symbol_locations(symbol, source, type_):
     def go():
         w = sublime.active_window()
@@ -950,6 +1004,10 @@ def get_current_selections() -> Dict[str, Any]:
 
     Returns: {project_file, project_file_total_lines, selections: [{start_line_number,
     stop_line_number, text}, ...]}.
+
+    Also available as a chain pseudo-command inside `run_sublime_command`
+    under the same name. Both paths share the `_read_selections` helper,
+    so the output shape and edge-case behavior are identical.
     """
     def go():
         w = sublime.active_window()
@@ -958,32 +1016,7 @@ def get_current_selections() -> Dict[str, Any]:
         view = w.active_view()
         if view is None:
             raise RuntimeError("no active view")
-
-        regions = list(view.sel())
-        if not regions:
-            raise RuntimeError("active view has no selection regions")
-
-        name = view.file_name() or view.name() or "<untitled {}>".format(view.id())
-        project_file_total_lines = _count_lines(view.substr(sublime.Region(0, view.size())))
-
-        def region_to_dict(r):
-            start_row, _ = view.rowcol(r.begin())
-            end_row, end_col = view.rowcol(r.end())
-            # If a non-empty selection ends at column 0, the visible last
-            # highlighted line is the previous one.
-            if not r.empty() and end_col == 0 and end_row > 0:
-                end_row -= 1
-            return {
-                "start_line_number": start_row + 1,
-                "stop_line_number": end_row + 1,
-                "text": view.substr(r),
-            }
-
-        return {
-            "project_file": name,
-            "project_file_total_lines": project_file_total_lines,
-            "selections": [region_to_dict(r) for r in regions],
-        }
+        return _read_selections(view)
 
     return _on_main(go)
 
@@ -1117,11 +1150,35 @@ def run_sublime_command(commands: List[Dict[str, Any]]) -> Dict[str, Any]:
            "scope": "view"}
       ])
 
+    Examples -- inline selection capture (read -> mutate -> read in one call).
+    Sublime's command system has no return-value channel (run_command always
+    returns None), so we expose `get_current_selections` as a chain pseudo-
+    command that the dispatcher handles itself. Each capture step's payload
+    appears under `result` in that step's entry of the returned `results`
+    array, with the same shape as the top-level get_current_selections tool:
+      run_sublime_command([
+          {"command": "open_file", "args": {"file": "/path/to/file"},
+           "scope": "window"},
+          {"command": "goto_line", "args": {"line": 113}, "scope": "window"},
+          {"command": "expand_selection_to_paragraph", "scope": "view"},
+          {"command": "get_current_selections", "scope": "view"},
+          {"command": "expand_selection", "args": {"to": "scope"},
+           "scope": "view"},
+          {"command": "get_current_selections", "scope": "view"}
+      ])
+
+    Pseudo-commands (handled inside the dispatcher, never forwarded to ST):
+      - get_current_selections: read the active view's (or `file_path`'s)
+        selection state into this step's `result` field. Identical output
+        shape and edge-case behavior to the top-level MCP tool of the same
+        name -- both call _read_selections under the hood.
+
     Notes:
       - Selection-based commands (sort_lines, toggle_comment, upper_case,
         duplicate_line, swap_line_up/down, join_lines) operate on whatever
         the user currently has selected. Pair with get_current_selections
-        first to know what they'll affect.
+        (top-level tool, or inline as a chain pseudo-command) to know what
+        they'll affect.
       - Plugin-installed commands work too (Package Control, formatters,
         LSP). Discover names via Tools > Developer > Command Logger.
       - Some commands open interactive panels (show_panel for find/replace,
@@ -1140,6 +1197,8 @@ def run_sublime_command(commands: List[Dict[str, Any]]) -> Dict[str, Any]:
               "ok": bool,
               "dirty": bool,      # only present for view-scoped commands
               "file": str | None, # only present for view-scoped commands
+              "result": dict,     # only present for pseudo-commands that
+                                  # produce a payload (e.g. get_current_selections)
               "error": str        # only present if ok is False
             },
             ...
@@ -1174,6 +1233,37 @@ def run_sublime_command(commands: List[Dict[str, Any]]) -> Dict[str, Any]:
                 "error": "missing 'command' key",
             })
             all_ok = False
+            continue
+
+        # Pseudo-commands: handled by the dispatcher itself, never forwarded
+        # to Sublime. Documented under "Pseudo-commands:" in the docstring
+        # above. Add new ones here, keeping the result envelope consistent
+        # with regular chain steps so callers don't have to special-case.
+        if cmd_name == "get_current_selections":
+            try:
+                if cmd_file:
+                    view, _ = _ensure_view(cmd_file)
+                else:
+                    view = _on_main(lambda: (
+                        sublime.active_window().active_view()
+                        if sublime.active_window() else None))
+                    if view is None:
+                        raise RuntimeError("no active view")
+                payload = _on_main(lambda v=view: _read_selections(v))
+                results.append({
+                    "command": cmd_name,
+                    "scope": cmd_scope,
+                    "ok": True,
+                    "result": payload,
+                })
+            except Exception as e:
+                results.append({
+                    "command": cmd_name,
+                    "scope": cmd_scope,
+                    "ok": False,
+                    "error": str(e),
+                })
+                all_ok = False
             continue
 
         try:
