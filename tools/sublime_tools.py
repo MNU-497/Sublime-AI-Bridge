@@ -30,6 +30,38 @@ LOAD_POLL_TIMEOUT = 5.0
 FILENAME_RESULT_CAP = 1000
 SEARCH_CANCEL_CHECK_EVERY = 16  # check cancel flag once per N files
 
+# search_text_in_project skips files larger than this. Real source files in
+# typical projects don't approach this; the cap exists to avoid pathological
+# minified bundles, generated SQL dumps, lockfiles, etc. eating the budget.
+MAX_SEARCHABLE_FILE_BYTES = 5 * 1024 * 1024
+
+# Extensions assumed to be text. Files with these extensions skip the
+# NUL-byte sniff entirely (saves one open() per file -- the dominant cost
+# on a large tree). Anything else falls through to the sniff.
+_TEXT_EXTENSIONS = frozenset({
+    ".py", ".pyi", ".pyx",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".json", ".jsonc", ".json5",
+    ".html", ".htm", ".xhtml", ".xml", ".svg",
+    ".css", ".scss", ".sass", ".less",
+    ".md", ".markdown", ".rst", ".txt", ".text",
+    ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".properties", ".env",
+    ".php", ".phtml", ".twig", ".blade.php",
+    ".rb", ".erb",
+    ".go", ".rs", ".java", ".kt", ".scala", ".groovy",
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx",
+    ".cs", ".vb", ".fs", ".fsx",
+    ".m", ".mm",
+    ".swift",
+    ".sh", ".bash", ".zsh", ".fish", ".ps1", ".bat", ".cmd",
+    ".sql",
+    ".lua", ".pl", ".pm", ".tcl", ".r",
+    ".vue", ".svelte", ".astro",
+    ".gradle", ".sbt", ".cmake",
+    ".dockerfile", ".tf", ".tfvars",
+    ".csv", ".tsv", ".log",
+})
+
 SCOPE_SELECTORS = [
     "meta.function",
     "meta.method",
@@ -183,9 +215,26 @@ def _symbol_region_to_dict(view, sr):
 
 
 def _get_search_config():
+    """Return a list of (folder_root, file_excludes, folder_excludes) tuples,
+    one per project folder.
+
+    Excludes are merged from three layers, matching what Sublime's own
+    Goto/Find-in-Files honors:
+
+    1. Per-folder entry in project_data["folders"][i] (`folder_exclude_patterns`,
+       `file_exclude_patterns`). This is where users typically scope an exclude
+       to a single root -- the layer the previous implementation missed.
+    2. Top-level project_data keys (apply to every folder).
+    3. Preferences.sublime-settings (global), plus `binary_file_patterns` for
+       files.
+
+    Folder roots are resolved to absolute paths so per-folder matching against
+    project_data["folders"][i]["path"] (which may be relative to the .sublime-
+    project file) lines up with what `window.folders()` reports.
+    """
     w = sublime.active_window()
     if w is None:
-        return [], [], []
+        return []
     folders = list(w.folders())
     project_data = w.project_data() or {}
     prefs = sublime.load_settings("Preferences.sublime-settings")
@@ -194,37 +243,131 @@ def _get_search_config():
         v = obj.get(key)
         return list(v) if v else []
 
-    file_excludes = (
-        _list(project_data, "file_exclude_patterns")
-        + (prefs.get("file_exclude_patterns") or [])
+    top_file_excludes = _list(project_data, "file_exclude_patterns")
+    top_folder_excludes = _list(project_data, "folder_exclude_patterns")
+    pref_file_excludes = (
+        (prefs.get("file_exclude_patterns") or [])
         + (prefs.get("binary_file_patterns") or [])
+        # `index_exclude_patterns` is the indexer's allowlist for "don't
+        # bother reading this file's contents" -- exactly what we want
+        # for grep, and a well-tuned project usually has it set to skip
+        # generated/minified noise.
+        + (prefs.get("index_exclude_patterns") or [])
     )
-    folder_excludes = (
-        _list(project_data, "folder_exclude_patterns")
-        + (prefs.get("folder_exclude_patterns") or [])
-    )
-    return folders, file_excludes, folder_excludes
+    pref_folder_excludes = prefs.get("folder_exclude_patterns") or []
+
+    # Build a path -> folder-entry map so we can attach per-folder excludes
+    # to the corresponding resolved root from window.folders(). project_data
+    # paths can be relative; resolve against the .sublime-project's directory.
+    project_file = w.project_file_name()
+    project_dir = os.path.dirname(project_file) if project_file else None
+    entries_by_root = {}
+    for entry in (project_data.get("folders") or []):
+        p = entry.get("path")
+        if not p:
+            continue
+        if not os.path.isabs(p) and project_dir:
+            p = os.path.join(project_dir, p)
+        try:
+            key = os.path.normcase(os.path.normpath(p))
+        except Exception:
+            continue
+        entries_by_root[key] = entry
+
+    out = []
+    for folder in folders:
+        try:
+            key = os.path.normcase(os.path.normpath(folder))
+        except Exception:
+            key = folder
+        entry = entries_by_root.get(key, {})
+        file_excludes = (
+            _list(entry, "file_exclude_patterns")
+            + top_file_excludes
+            + pref_file_excludes
+        )
+        folder_excludes = (
+            _list(entry, "folder_exclude_patterns")
+            + top_folder_excludes
+            + pref_folder_excludes
+        )
+        out.append((folder, file_excludes, folder_excludes))
+    return out
 
 
 def _matches_any(name, patterns):
     return any(fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
+def _dir_excluded(dirpath, dirname, root, folder_excludes):
+    """Test a directory against folder_exclude_patterns.
+
+    Sublime's documented behavior matches basenames, but users also write
+    path-style patterns scoped to the project tree. We test three forms so
+    all common shapes work:
+
+      1. bare basename ("_common")                 -- Sublime's default
+      2. relpath from the folder root ("app/_common")
+      3. relpath with the folder's basename prepended
+         ("admin-webapp/app/_common") -- matches how users naturally write
+         the path, including the folder name itself
+    """
+    if _matches_any(dirname, folder_excludes):
+        return True
+    full = os.path.join(dirpath, dirname)
+    try:
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+    except ValueError:
+        return False
+    if _matches_any(rel, folder_excludes):
+        return True
+    rel_with_root = os.path.basename(root.rstrip(os.sep) or root) + "/" + rel
+    return _matches_any(rel_with_root, folder_excludes)
+
+
 def _walk(root, file_excludes, folder_excludes):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not _matches_any(d, folder_excludes)]
+        dirnames[:] = [
+            d for d in dirnames
+            if not _dir_excluded(dirpath, d, root, folder_excludes)
+        ]
         for fn in filenames:
             if _matches_any(fn, file_excludes):
                 continue
             yield os.path.join(dirpath, fn)
 
 
-def _looks_binary(path):
+def _load_searchable_bytes(path):
+    """Read a file's raw bytes, skipping anything not worth grepping.
+
+    Returns bytes, or None if the file should be skipped (too large,
+    unreadable, or appears binary).
+
+    Returning bytes (not str) is deliberate: the search hot path runs a
+    compiled regex over the whole buffer first to decide whether the file
+    matches at all, and only decodes / splits into lines for the (usually
+    small) set of files that actually contain a hit. Decoding every
+    surviving file up front was the previous bottleneck on large trees.
+
+    Files with known text extensions skip the NUL-byte sniff entirely;
+    unknown extensions are sniffed against the bytes already loaded.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if st.st_size > MAX_SEARCHABLE_FILE_BYTES:
+        return None
     try:
         with open(path, "rb") as fb:
-            return b"\x00" in fb.read(4096)
+            data = fb.read()
     except OSError:
-        return True
+        return None
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in _TEXT_EXTENSIONS:
+        if b"\x00" in data[:4096]:
+            return None
+    return data
 
 
 def _count_lines(buf):
@@ -322,7 +465,7 @@ def find_files_in_project(pattern: str, regex: bool = False,
 
     pattern: fnmatch-style glob by default (e.g. "*.py"); set regex=true to treat as a Python regex. The optional `glob` arg is an additional fnmatch filter applied on top. Honors project + global file/folder exclude patterns. Capped at 1000 results.
     """
-    folders, file_excludes, folder_excludes = _on_main(_get_search_config)
+    folder_configs = _on_main(_get_search_config)
     if regex:
         rx = re.compile(pattern)
         def match(name): return rx.search(name) is not None
@@ -332,7 +475,7 @@ def find_files_in_project(pattern: str, regex: bool = False,
 
     results = []
     checked = 0
-    for folder in folders:
+    for folder, file_excludes, folder_excludes in folder_configs:
         for path in _walk(folder, file_excludes, folder_excludes):
             checked += 1
             if checked % SEARCH_CANCEL_CHECK_EVERY == 0 and is_cancelled():
@@ -887,43 +1030,59 @@ def search_text_in_project(pattern: str, regex: bool = False, case_sensitive: bo
 
     pattern: literal substring by default; set regex=true for Python `re` regex.
     Optional `glob` filters by basename (fnmatch) (e.g. "*.php"). Skips files
-    matching project + global exclude patterns and files with NUL bytes in
-    the first 4KB. Returns up to `max_results` entries: {path, line, text}.
+    matching project + global exclude patterns (including
+    `index_exclude_patterns`), files larger than MAX_SEARCHABLE_FILE_BYTES,
+    and files that appear binary (NUL bytes in the first 4KB, only sniffed
+    for unknown extensions). Returns up to `max_results` entries:
+    {path, line, text}.
 
     For matching against unsaved buffer state, use `search_text_in_open_files`.
     """
-    folders, file_excludes, folder_excludes = _on_main(_get_search_config)
+    folder_configs = _on_main(_get_search_config)
     flags = 0 if case_sensitive else re.IGNORECASE
-    rx = re.compile(pattern if regex else re.escape(pattern), flags)
+    # Compile against bytes so the whole-file pre-filter below is a single
+    # C-level scan, no decode. Same regex (recompiled for str) is used to
+    # walk lines once we know the file actually contains a hit.
+    pattern_b = pattern.encode("utf-8") if regex else re.escape(pattern.encode("utf-8"))
+    rx_bytes = re.compile(pattern_b, flags)
+    rx_str = re.compile(pattern if regex else re.escape(pattern), flags)
     glob_match = (lambda n: fnmatch.fnmatchcase(n, glob)) if glob else (lambda n: True)
 
     results: List[Dict[str, Any]] = []
     checked = 0
-    for folder in folders:
+    for folder, file_excludes, folder_excludes in folder_configs:
         for path in _walk(folder, file_excludes, folder_excludes):
             checked += 1
             if checked % SEARCH_CANCEL_CHECK_EVERY == 0 and is_cancelled():
                 return results
             if not glob_match(os.path.basename(path)):
                 continue
-            if _looks_binary(path):
+            data = _load_searchable_bytes(path)
+            if data is None:
+                continue
+            # Whole-file pre-filter: if the pattern doesn't appear anywhere
+            # in the bytes, skip the decode + line walk entirely. This is
+            # the dominant speedup on large trees -- most files don't match,
+            # and a single bytes-level regex scan is far cheaper than
+            # splitlines() + per-line regex.
+            if rx_bytes.search(data) is None:
                 continue
             try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    for lineno, line in enumerate(f, 1):
-                        if rx.search(line):
-                            results.append({
-                                "path": path,
-                                "line": lineno,
-                                "text": line.rstrip("\n")[:500],
-                            })
-                            if len(results) >= max_results:
-                                return results
-                        # Mid-file cancel check: catastrophic regex on a single
-                        # large file is the worst case; the per-file check above
-                        # alone wouldn't catch it.
-                        if lineno % 1024 == 0 and is_cancelled():
+                text = data.decode("utf-8", errors="replace")
+                for lineno, line in enumerate(text.splitlines(), 1):
+                    if rx_str.search(line):
+                        results.append({
+                            "path": path,
+                            "line": lineno,
+                            "text": line[:500],
+                        })
+                        if len(results) >= max_results:
                             return results
+                    # Mid-file cancel check: catastrophic regex on a single
+                    # large file is the worst case; the per-file check above
+                    # alone wouldn't catch it.
+                    if lineno % 1024 == 0 and is_cancelled():
+                        return results
             except OSError:
                 continue
     return results
