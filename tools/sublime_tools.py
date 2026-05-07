@@ -77,6 +77,24 @@ def _text_point_1based(view, row, col):
     return view.text_point(int(row) - 1, int(col) - 1)
 
 
+def _wait_until_loaded(view, timeout=LOAD_POLL_TIMEOUT):
+    """Block (off the main thread) until view.is_loading() returns False, or
+    timeout elapses. Returns True if the view loaded in time, False on timeout.
+
+    MUST be called from a background thread, not the main thread: it polls
+    is_loading() via _on_main and sleeps between polls. If invoked from the
+    main thread, the sleep would prevent ST from ever finishing the load.
+    """
+    if view is None:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _on_main(lambda v=view: v.is_loading()):
+            return True
+        time.sleep(0.05)
+    return False
+
+
 def _ensure_view(file_path):
     def init():
         w = sublime.active_window()
@@ -88,11 +106,7 @@ def _ensure_view(file_path):
             view = w.open_file(file_path, sublime.TRANSIENT)
         return view, was_open
     view, was_open = _on_main(init)
-    deadline = time.time() + LOAD_POLL_TIMEOUT
-    while time.time() < deadline:
-        if not _on_main(lambda v=view: v.is_loading()):
-            break
-        time.sleep(0.05)
+    _wait_until_loaded(view)
     return view, was_open
 
 
@@ -1045,56 +1059,63 @@ def set_current_selection_content(content: str) -> Dict[str, Any]:
     return _on_main(go)
 
 
-def run_sublime_command(command: str, args: Optional[Dict[str, Any]] = None,
-                        file_path: Optional[str] = None) -> Dict[str, Any]:
-    """Run an arbitrary Sublime Text command. Escape hatch.
+def run_sublime_command(commands: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Run one or more Sublime Text commands, each with its own scope.
 
-    If `file_path` is given, runs as a TextCommand on that view (loading it
-    transiently if needed). Otherwise runs as a WindowCommand on the active
-    window.
+    Always takes an array of commands. Single commands are just an array
+    of length one. Each command specifies its own scope ("view" or "window")
+    so a single call can mix scopes — e.g. open_file (window) followed by
+    expand_selection (view) — without the chain-scope conflicts that occur
+    when using Sublime's built-in `chain` command across mixed scopes.
 
-    Examples -- window-level (no file_path):
-      run_sublime_command("new_window")
-      run_sublime_command("save_all")
-      run_sublime_command("show_overlay", {"overlay": "command_palette", "text": "Format"})
-      run_sublime_command("show_overlay", {"overlay": "goto", "show_files": true, "text": "@some_function"})
-      run_sublime_command("toggle_side_bar")
+    Reference: https://docs.sublimetext.io/reference/commands.html
 
-    Examples -- view-level (file_path required):
-      run_sublime_command("close", file_path="/path/to/file")
-      run_sublime_command("detect_indentation", file_path="/path/to/file")
-      run_sublime_command("duplicate_line", file_path="/path/to/file")
-      run_sublime_command("goto_line", {"line": 1688}, "/path/to/file")
-      run_sublime_command("reindent", {"single_line": false}, "/path/to/file")
-      run_sublime_command("revert", file_path="/path/to/file")
-      run_sublime_command("undo", file_path="/path/to/file")
-      run_sublime_command("save", file_path="/path/to/file")
-      run_sublime_command("set_file_type", {"syntax": "Packages/PHP/PHP.sublime-syntax"}, "/path/to/file")
-      run_sublime_command("sort_lines", {"case_sensitive": false}, "/path/to/file")
-      run_sublime_command("toggle_comment", {"block": false}, "/path/to/file")
-      run_sublime_command("upper_case", file_path="/path/to/file")
+    Each command in the list is a dict with:
+      - command (str):     The Sublime command name (required)
+      - args (dict):       Arguments for the command (optional, defaults to {})
+      - scope (str):       "view" or "window" (optional, defaults to "window")
+      - file_path (str):   Target file for view-scoped commands (optional;
+                           if omitted on a view command, uses active view)
 
-    Rule: If the user says "help me find [criteria]", generate a regex pattern and immediately run run_sublime_command(command: show_panel, args: {"panel": "find_in_files", "pattern": "[GENERATED_REGEX]", "regex": true, "case_sensitive": false, "whole_word": false}). Ensure all required arguments are present.
+    Examples -- single window command:
+      run_sublime_command([
+          {"command": "new_window"}
+      ])
 
-    Examples of [criteria] to regex:
-      "X"                          \\bX\\b
-      "X or Y"                     \\b(?:X|Y)\\b
-      "X and Y" (same line)        \\bX\\b.*\\bY\\b|\\bY\\b.*\\bX\\b
-      "X near Y"                   \\bX\\b.{0,80}\\bY\\b|\\bY\\b.{0,80}\\bX\\b
-      "X within N chars of Y"      \\bX\\b.{0,N}\\bY\\b|\\bY\\b.{0,N}\\bX\\b
-      "X followed by Y"            \\bX\\b.{0,80}?\\bY\\b
-      "X but not Y" (same line)    ^(?!.*\\bY\\b).*\\bX\\b
-      "lines starting with X"      ^\\s*X
-      "lines ending with X"        X\\s*$
-      "function X" (PHP/JS)        \\bfunction\\s+X\\b
-      "function X" (Python)        \\bdef\\s+X\\b
-      "method X" (PHP)             \\b(?:public|private|protected|static|\\s)+function\\s+X\\b
-      "TODO comments"              \\b(?:TODO|FIXME|XXX|HACK)\\b
-      "trailing whitespace"        [ \\t]+$
-      "any number"                 \\b\\d+\\b
-      "URL"                        https?://\\S+
-      "email"                      \\b[\\w.+-]+@[\\w.-]+\\.\\w+\\b
-      "string literal X"           ["']X["']        (single OR double quoted)
+    Examples -- single view command on a specific file:
+      run_sublime_command([
+          {"command": "goto_line", "args": {"line": 1688},
+           "scope": "view", "file_path": "/path/to/file"}
+      ])
+
+    Examples -- mixed-scope chain (the case that motivated this):
+      run_sublime_command([
+          {"command": "open_file", "args": {"file": "/path/to/file"},
+           "scope": "window"},
+          {"command": "goto_line", "args": {"line": 113},
+           "scope": "window"},
+          {"command": "expand_selection", "args": {"to": "brackets"},
+           "scope": "view"},
+          {"command": "show_at_center", "scope": "view"}
+      ])
+
+    Examples -- view command on the currently active view (no file_path):
+      run_sublime_command([
+          {"command": "expand_selection", "args": {"to": "indentation"},
+           "scope": "view"}
+      ])
+
+    Examples -- view command on the currently active view (no file_path):
+      run_sublime_command([
+          {"command": "open_file",
+           "args": {"file": "/path/to/file"},
+           "scope": "window"},
+          {"command": "goto_line",
+           "args": {"line": 113},
+           "scope": "window"},
+          {"command": "expand_selection_to_paragraph",
+           "scope": "view"}
+      ])
 
     Notes:
       - Selection-based commands (sort_lines, toggle_comment, upper_case,
@@ -1102,29 +1123,116 @@ def run_sublime_command(command: str, args: Optional[Dict[str, Any]] = None,
         the user currently has selected. Pair with get_current_selections
         first to know what they'll affect.
       - Plugin-installed commands work too (Package Control, formatters,
-        LSP). Discover names via Tools > Developer > Command Logger,
-        which prints every command ST runs.
+        LSP). Discover names via Tools > Developer > Command Logger.
       - Some commands open interactive panels (show_panel for find/replace,
-        prompt_open_file) -- useful for "show the user something" but
+        prompt_open_file) — useful for "show the user something" but
         won't return programmatic data to the caller.
+      - Commands run sequentially on the main thread. If one fails, the
+        rest still attempt to run; per-command success is in `results`.
 
-    Returns {ok, scope, dirty?}.
+    Returns:
+        {
+          "ok": bool,             # True if all commands succeeded
+          "results": [            # one entry per input command, in order
+            {
+              "command": str,
+              "scope": "view" | "window",
+              "ok": bool,
+              "dirty": bool,      # only present for view-scoped commands
+              "file": str | None, # only present for view-scoped commands
+              "error": str        # only present if ok is False
+            },
+            ...
+          ]
+        }
     """
-    args = args or {}
-    if file_path:
-        view, _was_open = _ensure_view(file_path)
-        def go_view():
-            view.run_command(command, args)
-            return {"ok": True, "scope": "view", "dirty": view.is_dirty()}
-        return _on_main(go_view)
+    if not commands or not isinstance(commands, list):
+        raise ValueError("commands must be a non-empty list")
 
-    def go_win():
-        w = sublime.active_window()
-        if w is None:
-            raise RuntimeError("no active Sublime window")
-        w.run_command(command, args)
-        return {"ok": True, "scope": "window"}
-    return _on_main(go_win)
+    # Dispatch each command via its own _on_main hop, with off-main waits
+    # between hops. We CANNOT run the whole chain inside one _on_main call:
+    # that would hold the main thread, and any open_file in the chain would
+    # never get to finish loading — subsequent commands would race against
+    # an unloaded view. See _wait_until_loaded for the same threading rule.
+    if _on_main(lambda: sublime.active_window()) is None:
+        raise RuntimeError("no active Sublime window")
+
+    results = []
+    all_ok = True
+
+    for cmd in commands:
+        cmd_name = cmd.get("command")
+        cmd_args = cmd.get("args") or {}
+        cmd_scope = cmd.get("scope", "window")
+        cmd_file = cmd.get("file_path")
+
+        if not cmd_name:
+            results.append({
+                "command": None,
+                "scope": cmd_scope,
+                "ok": False,
+                "error": "missing 'command' key",
+            })
+            all_ok = False
+            continue
+
+        try:
+            if cmd_scope == "view":
+                # Resolve the target view. _ensure_view already waits for
+                # loading; for the no-file_path path we just grab whatever's
+                # currently active (which is whatever a preceding open_file
+                # left us on, since we waited for it below).
+                if cmd_file:
+                    view, _ = _ensure_view(cmd_file)
+                else:
+                    view = _on_main(lambda: (
+                        sublime.active_window().active_view()
+                        if sublime.active_window() else None))
+                    if view is None:
+                        raise RuntimeError("no active view")
+
+                _on_main(lambda v=view, n=cmd_name, a=cmd_args:
+                         v.run_command(n, a))
+                dirty, fname = _on_main(lambda v=view:
+                                        (v.is_dirty(), v.file_name()))
+                results.append({
+                    "command": cmd_name,
+                    "scope": "view",
+                    "ok": True,
+                    "dirty": dirty,
+                    "file": fname,
+                })
+            else:
+                def _run_window(n=cmd_name, a=cmd_args):
+                    w = sublime.active_window()
+                    if w is None:
+                        raise RuntimeError("no active Sublime window")
+                    w.run_command(n, a)
+                _on_main(_run_window)
+                # If the command opened or switched to a view that's still
+                # loading from disk (open_file is the obvious case), wait for
+                # the load to finish before running the next command — the
+                # whole point of letting the caller chain commands is that
+                # later steps in the chain can target the just-opened file.
+                av = _on_main(lambda: (
+                    sublime.active_window().active_view()
+                    if sublime.active_window() else None))
+                _wait_until_loaded(av)
+                results.append({
+                    "command": cmd_name,
+                    "scope": "window",
+                    "ok": True,
+                })
+        except Exception as e:
+            results.append({
+                "command": cmd_name,
+                "scope": cmd_scope,
+                "ok": False,
+                "error": str(e),
+            })
+            all_ok = False
+
+    return {"ok": all_ok, "results": results}
 
 
 # ============================================================================
