@@ -31,11 +31,8 @@ _mcp = None  # type: MCPServer | None
 # ---------------------------------------------------------------- text command
 # Defined at the top level so ST registers it as a TextCommand. The tools
 # package invokes it by name, so this class never imports from tools/.
-#
-# Class names use "AiBridge" (not "AIBridge") on purpose: ST snake-cases
-# command class names, and "AIBridge" would yield "a_i_bridge". Leave this.
 
-class AiBridgeApplyEditsCommand(sublime_plugin.TextCommand):
+class ai_bridge_apply_edits(sublime_plugin.TextCommand):
     """Atomic batch edit. `edits` is a list of {start, end, text} dicts using
     absolute character offsets. Edits are applied in reverse order so earlier
     replacements don't shift the offsets of later ones. Whole batch forms a
@@ -141,7 +138,7 @@ def plugin_unloaded():
 
 # ---------------------------------------------------------------- ux commands
 
-class AiBridgeShowPortCommand(sublime_plugin.WindowCommand):
+class ai_bridge_show_port(sublime_plugin.WindowCommand):
     """Command palette: report the bound MCP port and URL."""
     def is_enabled(self):
         return _transport is not None
@@ -154,7 +151,7 @@ class AiBridgeShowPortCommand(sublime_plugin.WindowCommand):
         sublime.message_dialog("AI Bridge MCP endpoint:\n\n{}".format(url))
 
 
-class AiBridgeRestartCommand(sublime_plugin.WindowCommand):
+class ai_bridge_restart(sublime_plugin.WindowCommand):
     """Command palette: restart the embedded MCP server."""
     def run(self):
         plugin_unloaded()
