@@ -62,6 +62,31 @@ Sublime's status bar.
 | `get_current_selections()` | Return the active view's cursor/selection state with the file path and 1-indexed line ranges. |
 | `run_sublime_command(command, args?, file_path?)` | Run any Sublime Text command (formatters, sort, custom plugins). Escape hatch. |
 
+## Resources (@-mention from your chat)
+
+In addition to tools (called by the LLM) and prompts (picked from a slash
+menu), AI Bridge exposes editor state as MCP **resources** under the
+`aibridge://` scheme. Clients that support resource @-mentions (Claude
+Desktop, Cursor, and others — Claude Code does not yet) let you inline these
+into a chat message; the client substitutes the content where the @mention
+sat, so the LLM sees one composite message.
+
+| Picker label | URI on the wire | What you get |
+|---|---|---|
+| `selection` | `aibridge://selection` | The active view's selection, with file path + line range as a header and a syntax-fenced body. |
+
+You don't type the URI. Most clients render an `@`-picker (Claude Desktop /
+Cursor: hit `@` or click an attach icon, search by label) and the URI
+travels invisibly. The user-typed message ends up looking roughly like:
+
+> Evaluate @selection and tell me how to fix the bug causing an infinite loop.
+
+The exact UX (inline chip vs. attachment) varies by client; the picker
+label is the only thing the server controls.
+
+The `aibridge://` URI prefix matches the package's short name and avoids
+overlap with anything Sublime HQ may ship under their own namespace.
+
 ## How it works
 
 Sublime Text's Python API only runs *inside* Sublime Text. Earlier versions
