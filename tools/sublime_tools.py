@@ -299,6 +299,45 @@ def _matches_any(name, patterns):
     return any(fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
+# Path-glob -> regex. Treats `/` as the path separator and `**` as
+# "zero or more path segments". `*` matches within a single segment, `?`
+# matches one non-/ character. Anchored at both ends so the whole
+# project-relative path must match.
+#
+# Supported:    foo/*.py        application/**        src/**/*.test.ts
+# Not supported: brace expansion ({a,b}), character classes ([...]).
+def _path_glob_to_regex(glob_pattern):
+    out = ["^"]
+    i = 0
+    while i < len(glob_pattern):
+        c = glob_pattern[i]
+        if c == "*":
+            if i + 1 < len(glob_pattern) and glob_pattern[i + 1] == "*":
+                # `**/` -> any number of leading directories (incl. zero).
+                if i + 2 < len(glob_pattern) and glob_pattern[i + 2] == "/":
+                    out.append("(?:.*/)?")
+                    i += 3
+                    continue
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+            i += 1
+            continue
+        if c == "?":
+            out.append("[^/]")
+            i += 1
+            continue
+        if c in r".+^$()|{}\\":
+            out.append("\\" + c)
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    out.append("$")
+    return re.compile("".join(out))
+
+
 def _dir_excluded(dirpath, dirname, root, folder_excludes):
     """Test a directory against folder_exclude_patterns.
 
@@ -460,32 +499,59 @@ def list_folders_in_project() -> Dict[str, Any]:
 
 
 def find_files_in_project(pattern: str, regex: bool = False,
-                          glob: Optional[str] = None) -> List[str]:
-    """Search for files by basename across the active project's folders.
+                          glob: Optional[str] = None,
+                          max_results: int = FILENAME_RESULT_CAP
+                          ) -> Dict[str, Any]:
+    """Search for files across the active project's folders.
 
-    pattern: fnmatch-style glob by default (e.g. "*.py"); set regex=true to treat as a Python regex. The optional `glob` arg is an additional fnmatch filter applied on top. Honors project + global file/folder exclude patterns. Capped at 1000 results.
+    `pattern` is matched against each file's BASENAME -- fnmatch-style glob
+    by default (e.g. "*.py", "test_*.py"); set regex=true to treat it as a
+    Python regex (re.search semantics). The optional `glob` arg is a PATH
+    glob restricting which directories to search, matched against each
+    file's project-relative path (e.g. "application/**", "src/**/*.test.ts").
+    Use "**" for recursive directory matching; "*" matches within a single
+    segment.
+
+    Honors project + global file/folder exclude patterns. Capped at
+    `max_results` (default 1000); the returned `truncated` flag is true if
+    the cap was hit.
     """
     folder_configs = _on_main(_get_search_config)
     if regex:
         rx = re.compile(pattern)
-        def match(name): return rx.search(name) is not None
+        def match_basename(name): return rx.search(name) is not None
     else:
-        def match(name): return fnmatch.fnmatchcase(name, pattern)
-    glob_match = (lambda n: fnmatch.fnmatchcase(n, glob)) if glob else (lambda n: True)
+        def match_basename(name): return fnmatch.fnmatchcase(name, pattern)
+
+    if glob:
+        path_rx = _path_glob_to_regex(glob)
+        def match_path(rel): return path_rx.match(rel) is not None
+    else:
+        def match_path(rel): return True
 
     results = []
+    truncated = False
     checked = 0
     for folder, file_excludes, folder_excludes in folder_configs:
         for path in _walk(folder, file_excludes, folder_excludes):
             checked += 1
             if checked % SEARCH_CANCEL_CHECK_EVERY == 0 and is_cancelled():
-                return results
+                return {"files": results, "count": len(results),
+                        "truncated": truncated}
             base = os.path.basename(path)
-            if match(base) and glob_match(base):
-                results.append(path)
-                if len(results) >= FILENAME_RESULT_CAP:
-                    return results
-    return results
+            if not match_basename(base):
+                continue
+            # Project-relative path, normalized to forward slashes for
+            # cross-platform glob matching.
+            rel = os.path.relpath(path, folder).replace(os.sep, "/")
+            if not match_path(rel):
+                continue
+            results.append(path)
+            if len(results) >= max_results:
+                truncated = True
+                return {"files": results, "count": len(results),
+                        "truncated": truncated}
+    return {"files": results, "count": len(results), "truncated": truncated}
 
 
 # ============================================================================

@@ -24,7 +24,7 @@ Sublime's status bar.
 | Tool | What it does |
 |---|---|
 | `list_folders_in_project()` | Root folders + project file of the active ST window. |
-| `find_files_in_project(pattern, regex?, glob?)` | Find files by basename across the project. |
+| `find_files_in_project(pattern, regex?, glob?, max_results?)` | Find files across the project. `pattern` is fnmatched against the basename (or treated as a regex if `regex=true`); `glob` is a path glob (`application/**`, `src/**/*.test.ts`) restricting which directories to search. Capped at `max_results` (default 1000). Returns `{files, count, truncated}`. |
 
 ### File content
 
