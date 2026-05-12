@@ -12,7 +12,9 @@ leaving ST's undo stack intact.
 There is **no separate server process** to start. Drop the package into
 Sublime, and the MCP endpoint at `http://127.0.0.1:8765/mcp` comes up with it.
 
-https://github.com/user-attachments/assets/75c83736-1e69-49b7-bb53-dee496b22bf0
+| **Video Demo - Practical Use and Setup** |
+|---|
+| https://github.com/user-attachments/assets/75c83736-1e69-49b7-bb53-dee496b22bf0 |
 
 ## What it does
 

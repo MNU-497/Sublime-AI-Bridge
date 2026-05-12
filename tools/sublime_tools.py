@@ -1095,12 +1095,18 @@ def search_text_in_project(pattern: str, regex: bool = False, case_sensitive: bo
     """Grep file contents across the active project's folders (on disk).
 
     pattern: literal substring by default; set regex=true for Python `re` regex.
-    Optional `glob` filters by basename (fnmatch) (e.g. "*.php"). Skips files
-    matching project + global exclude patterns (including
-    `index_exclude_patterns`), files larger than MAX_SEARCHABLE_FILE_BYTES,
-    and files that appear binary (NUL bytes in the first 4KB, only sniffed
-    for unknown extensions). Returns up to `max_results` entries:
-    {path, line, text}.
+    Optional `glob` filters files via fnmatch against EITHER the basename OR
+    the path relative to the matching project folder (forward-slash
+    normalized). So bare patterns like "*.php" still work, and path-shaped
+    patterns like "application/*.php" also work. Note that fnmatch's `*`
+    crosses `/`, so "application/*.php" matches any .php file anywhere under
+    application/, not just direct children. Glob casing follows the OS
+    (case-insensitive on Windows, case-sensitive on Linux/macOS) to match
+    Sublime's own Find-in-Files behavior. Skips files matching project +
+    global exclude patterns (including `index_exclude_patterns`), files
+    larger than MAX_SEARCHABLE_FILE_BYTES, and files that appear binary
+    (NUL bytes in the first 4KB, only sniffed for unknown extensions).
+    Returns up to `max_results` entries: {path, line, text}.
 
     For matching against unsaved buffer state, use `search_text_in_open_files`.
     """
@@ -1112,7 +1118,24 @@ def search_text_in_project(pattern: str, regex: bool = False, case_sensitive: bo
     pattern_b = pattern.encode("utf-8") if regex else re.escape(pattern.encode("utf-8"))
     rx_bytes = re.compile(pattern_b, flags)
     rx_str = re.compile(pattern if regex else re.escape(pattern), flags)
-    glob_match = (lambda n: fnmatch.fnmatchcase(n, glob)) if glob else (lambda n: True)
+    # Match the glob against both the basename AND the relpath from the
+    # folder root, so path-shaped patterns like "application/*.php" work.
+    # The previous basename-only test silently matched zero files for any
+    # pattern containing a path separator. fnmatch.fnmatch (not fnmatchcase)
+    # is used so casing follows OS conventions -- on Windows "*.php" matches
+    # Foo.PHP, on Linux/macOS it doesn't, consistent with the filesystem.
+    if glob:
+        def glob_match(path, folder):
+            if fnmatch.fnmatch(os.path.basename(path), glob):
+                return True
+            try:
+                rel = os.path.relpath(path, folder).replace(os.sep, "/")
+            except ValueError:
+                return False
+            return fnmatch.fnmatch(rel, glob)
+    else:
+        def glob_match(path, folder):
+            return True
 
     results: List[Dict[str, Any]] = []
     checked = 0
@@ -1121,7 +1144,7 @@ def search_text_in_project(pattern: str, regex: bool = False, case_sensitive: bo
             checked += 1
             if checked % SEARCH_CANCEL_CHECK_EVERY == 0 and is_cancelled():
                 return results
-            if not glob_match(os.path.basename(path)):
+            if not glob_match(path, folder):
                 continue
             data = _load_searchable_bytes(path)
             if data is None:
