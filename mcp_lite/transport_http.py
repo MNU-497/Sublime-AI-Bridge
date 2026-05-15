@@ -28,12 +28,19 @@ _SERVER_SESSION_ID = str(uuid.uuid4())
 
 
 class HTTPTransport:
-    def __init__(self, mcp, host="127.0.0.1", port=8765, path="/mcp", logger=None):
+    def __init__(self, mcp, host="127.0.0.1", port=8765, path="/mcp",
+                 logger=None, allowed_origins=None, auth_token=None):
         self._mcp = mcp
         self.host = host
         self.port = int(port)
         self.path = path
         self._log = logger or (lambda *a, **kw: None)
+        # Extra origins (exact match) permitted in addition to the localhost
+        # defaults -- e.g. a separate-host web UI that drives this server from
+        # the user's browser. The auth_token is the real gate when these are
+        # set; CORS only constrains browsers, never native clients.
+        self._allowed_origins = frozenset(allowed_origins or ())
+        self._auth_token = auth_token or None
         self._httpd = None
         self._thread = None
         self._stop_event = threading.Event()
@@ -48,6 +55,7 @@ class HTTPTransport:
         self._stop_event.clear()
         handler_cls = _make_handler(
             self._mcp, self.path, self._log, self._stop_event,
+            self._allowed_origins, self._auth_token,
         )
         server_cls = _make_server(self._log)
         self._httpd = server_cls((self.host, self.port), handler_cls)
@@ -100,7 +108,7 @@ def _make_server(log):
     return _Server
 
 
-def _make_handler(mcp, mount_path, log, stop_event):
+def _make_handler(mcp, mount_path, log, stop_event, allowed_origins, auth_token):
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -113,18 +121,36 @@ def _make_handler(mcp, mount_path, log, stop_event):
             except Exception:
                 pass
 
-        def _reject_non_local(self):
+        def _reject_bad_origin(self):
             origin = self.headers.get("Origin", "")
-            if origin and not origin.startswith(_ALLOWED_ORIGIN_PREFIXES):
-                self.send_error(403, "non-local Origin rejected")
+            if origin and self._allowed_origin() is None:
+                self.send_error(403, "Origin not allowed")
                 return True
             return False
 
         def _allowed_origin(self):
             origin = self.headers.get("Origin", "")
-            if origin and origin.startswith(_ALLOWED_ORIGIN_PREFIXES):
+            if not origin:
+                return None
+            if origin.startswith(_ALLOWED_ORIGIN_PREFIXES):
+                return origin
+            if origin in allowed_origins:
                 return origin
             return None
+
+        def _check_auth(self):
+            """Return True if the request may proceed. When an auth token is
+            configured, every non-preflight request must carry it as
+            `Authorization: Bearer <token>`. CORS only constrains browsers, so
+            this token is what actually gates native and cross-origin callers."""
+            if not auth_token:
+                return True
+            header = self.headers.get("Authorization", "")
+            prefix = "Bearer "
+            if header.startswith(prefix) and header[len(prefix):] == auth_token:
+                return True
+            self.send_error(401, "missing or invalid Authorization token")
+            return False
 
         def _send_cors_headers(self):
             origin = self._allowed_origin()
@@ -160,7 +186,8 @@ def _make_handler(mcp, mount_path, log, stop_event):
                 return
             requested = self.headers.get(
                 "Access-Control-Request-Headers",
-                "Content-Type, Mcp-Session-Id, Accept, Mcp-Protocol-Version",
+                "Authorization, Content-Type, Mcp-Session-Id, Accept, "
+                "Mcp-Protocol-Version",
             )
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", origin)
@@ -177,7 +204,9 @@ def _make_handler(mcp, mount_path, log, stop_event):
             if self.path != mount_path:
                 self.send_error(404)
                 return
-            if self._reject_non_local():
+            if self._reject_bad_origin():
+                return
+            if not self._check_auth():
                 return
 
             # Open the SSE stream. We never emit JSON-RPC frames on it (this
@@ -222,6 +251,10 @@ def _make_handler(mcp, mount_path, log, stop_event):
                     pass
 
         def do_DELETE(self):
+            if self._reject_bad_origin():
+                return
+            if not self._check_auth():
+                return
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self._send_cors_headers()
@@ -233,7 +266,9 @@ def _make_handler(mcp, mount_path, log, stop_event):
             if self.path != mount_path:
                 self.send_error(404)
                 return
-            if self._reject_non_local():
+            if self._reject_bad_origin():
+                return
+            if not self._check_auth():
                 return
 
             try:

@@ -176,13 +176,25 @@ and the command palette entry **AI Bridge: Show Port** displays it.
 ```json
 {
     "host": "127.0.0.1",
-    "port": 8765
+    "port": 8765,
+    "allowed_origins": [],
+    "auth_token": ""
 }
 ```
 
-`host` is fixed to localhost regardless — the server rejects requests with
-non-localhost `Origin` headers. `port` is just the *preferred* port; the
-fallback walk above kicks in if it's busy.
+`host` stays on localhost — the server only listens on your own machine.
+`port` is just the *preferred* port; the fallback walk above kicks in if
+it's busy.
+
+By default the server rejects any request whose `Origin` header isn't
+localhost. `allowed_origins` adds extra browser origins (exact match,
+including scheme and port) — use it when a web UI served from another host
+drives the bridge from your browser. The request still goes to your own
+`127.0.0.1`; only the `Origin` header differs.
+
+`auth_token`, when set, requires every request to carry
+`Authorization: Bearer <token>`. CORS only constrains browsers, so this is
+the real access gate — set it whenever you widen `allowed_origins`.
 
 ## Connecting MCP clients
 

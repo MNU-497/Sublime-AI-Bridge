@@ -72,11 +72,14 @@ def _write_port_state(port):
         _log("could not write port state file: %s", e)
 
 
-def _bind_with_fallback(mcp, host, preferred_port):
+def _bind_with_fallback(mcp, host, preferred_port, allowed_origins, auth_token):
     last_err = None
     for offset in range(PORT_FALLBACK_RANGE):
         port = preferred_port + offset
-        transport = HTTPTransport(mcp, host=host, port=port, logger=_log)
+        transport = HTTPTransport(
+            mcp, host=host, port=port, logger=_log,
+            allowed_origins=allowed_origins, auth_token=auth_token,
+        )
         try:
             transport.start()
             return transport
@@ -98,6 +101,8 @@ def plugin_loaded():
         settings = _settings()
         host = settings.get("host") or DEFAULT_HOST
         port = int(settings.get("port") or DEFAULT_PORT)
+        allowed_origins = settings.get("allowed_origins") or []
+        auth_token = settings.get("auth_token") or None
 
         mcp = MCPServer(SERVER_NAME, version=SERVER_VERSION, logger=_log)
         register_all_tools(mcp)
@@ -105,7 +110,8 @@ def plugin_loaded():
         register_all_resources(mcp)
 
         try:
-            transport = _bind_with_fallback(mcp, host, port)
+            transport = _bind_with_fallback(
+                mcp, host, port, allowed_origins, auth_token)
         except Exception as e:
             _log("failed to start MCP server: %s", e)
             sublime.status_message("AI Bridge: failed to start ({})".format(e))
