@@ -28,6 +28,7 @@ from ..mcp_lite.server import is_cancelled
 MAIN_THREAD_TIMEOUT = 15.0
 LOAD_POLL_TIMEOUT = 5.0
 FILENAME_RESULT_CAP = 1000
+FOLDER_RESULT_CAP = 200
 SEARCH_CANCEL_CHECK_EVERY = 16  # check cancel flag once per N files
 
 # search_text_in_project skips files larger than this. Real source files in
@@ -376,6 +377,20 @@ def _walk(root, file_excludes, folder_excludes):
             yield os.path.join(dirpath, fn)
 
 
+def _walk_dirs(root, folder_excludes):
+    """Yield `root`, then every directory beneath it that survives
+    folder_exclude_patterns. Same pruning as `_walk`, but emits directories
+    instead of files."""
+    yield root
+    for dirpath, dirnames, _filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if not _dir_excluded(dirpath, d, root, folder_excludes)
+        ]
+        for d in dirnames:
+            yield os.path.join(dirpath, d)
+
+
 def _load_searchable_bytes(path):
     """Read a file's raw bytes, skipping anything not worth grepping.
 
@@ -441,7 +456,7 @@ def _read_selections(view):
     any character actually highlighted. So selecting visible content of
     lines 3-5 always returns stop_line_number=5.
 
-    Untitled buffers: `project_file` falls back to a display name like
+    Untitled buffers: `file_path` falls back to a display name like
     `<untitled 5>` and CANNOT be passed to file-oriented tools.
     """
     regions = list(view.sel())
@@ -449,7 +464,7 @@ def _read_selections(view):
         raise RuntimeError("active view has no selection regions")
 
     name = view.file_name() or view.name() or "<untitled {}>".format(view.id())
-    project_file_total_lines = _count_lines(view.substr(sublime.Region(0, view.size())))
+    file_total_lines = _count_lines(view.substr(sublime.Region(0, view.size())))
 
     def region_to_dict(r):
         start_row, _ = view.rowcol(r.begin())
@@ -465,8 +480,8 @@ def _read_selections(view):
         }
 
     return {
-        "project_file": name,
-        "project_file_total_lines": project_file_total_lines,
+        "file_path": name,
+        "file_total_lines": file_total_lines,
         "selections": [region_to_dict(r) for r in regions],
     }
 
@@ -485,17 +500,90 @@ def _symbol_locations(symbol, source, type_):
 # 1. Project structure
 # ============================================================================
 
-def list_folders_in_project() -> Dict[str, Any]:
-    """List the root folders of the most-recently-active Sublime Text window's project.
+def list_folders_in_project(glob: Optional[str] = None,
+                            max_results: int = FOLDER_RESULT_CAP
+                            ) -> Dict[str, Any]:
+    """List the folders of the most-recently-active Sublime Text window's project.
 
-    Returns: {"folders": [absolute paths], "project_file": path or null}.
+    Returns the FULL recursive folder tree, not just the configured roots --
+    use it to understand project layout or build a directory tree. Honors the
+    same folder_exclude_patterns as Sublime's own Goto/Find-in-Files, so
+    `.git`, `node_modules`, build output, etc. are skipped.
+
+    `glob` (optional) is a PATH glob restricting which folders are returned,
+    matched against each folder's path RELATIVE TO ITS ROOT -- identical
+    syntax to `find_files_in_project`'s `glob`. Use "**" for recursive
+    matching across segments, "*" within a single segment, "?" for one
+    character.
+
+    Examples:
+        list_folders_in_project()
+            Every folder in the project (roots + all subfolders).
+        list_folders_in_project(glob="application/**")
+            Every folder at any depth under a top-level "application" dir.
+        list_folders_in_project(glob="src/*")
+            Only the immediate children of a top-level "src" dir.
+        list_folders_in_project(glob="**/migrations")
+            Every folder named "migrations", anywhere in the tree.
+
+    `roots` always lists the configured project roots, unfiltered. A scoped
+    `glob` like "application/**" matches paths BENEATH a root, so the roots
+    themselves won't appear in `folders` -- read them from `roots` when you
+    need the anchors. With no `glob`, `folders` includes the roots.
+
+    Capped at `max_results` (default 200); `truncated` is true if the cap was
+    hit. Returns: {roots, folders, project_file, count, truncated}. `roots`
+    and `folders` are absolute paths; `folders` is sorted. `project_file` is
+    the .sublime-project path or null.
     """
-    def go():
+    def gather():
         w = sublime.active_window()
         if w is None:
-            return {"folders": [], "project_file": None}
-        return {"folders": list(w.folders()), "project_file": w.project_file_name()}
-    return _on_main(go)
+            return None
+        return (_get_search_config(), w.project_file_name())
+
+    info = _on_main(gather)
+    if info is None:
+        return {"roots": [], "folders": [], "project_file": None,
+                "count": 0, "truncated": False}
+
+    folder_configs, project_file = info
+    roots = [folder for folder, _fx, _dx in folder_configs]
+
+    if glob:
+        path_rx = _path_glob_to_regex(glob)
+        def match_path(rel): return path_rx.match(rel) is not None
+    else:
+        def match_path(rel): return True
+
+    results: List[str] = []
+    truncated = False
+    checked = 0
+    for folder, _file_excludes, folder_excludes in folder_configs:
+        for d in _walk_dirs(folder, folder_excludes):
+            checked += 1
+            if checked % SEARCH_CANCEL_CHECK_EVERY == 0 and is_cancelled():
+                results.sort()
+                return {"roots": roots, "folders": results,
+                        "project_file": project_file,
+                        "count": len(results), "truncated": truncated}
+            # Folder path relative to its root; the root itself is "" so a
+            # scoped glob excludes it while a null glob keeps everything.
+            rel = os.path.relpath(d, folder).replace(os.sep, "/")
+            if rel == ".":
+                rel = ""
+            if not match_path(rel):
+                continue
+            results.append(d)
+            if len(results) >= max_results:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    results.sort()
+    return {"roots": roots, "folders": results, "project_file": project_file,
+            "count": len(results), "truncated": truncated}
 
 
 def find_files_in_project(pattern: str, regex: bool = False,
@@ -558,11 +646,11 @@ def find_files_in_project(pattern: str, regex: bool = False,
 # 2. File content
 # ============================================================================
 
-def get_file_content(project_file: str, start_line_number: int,
+def get_file_content(file_path: str, start_line_number: int,
                      stop_line_number: Optional[int] = None) -> Dict[str, Any]:
     """Return a slice of file contents by line number.
 
-    Reads `project_file` from disk and returns lines from `start_line_number` through `stop_line_number` INCLUSIVE. Both bounds are 1-indexed (matching every other row value in this server). Asking for start_line_number=1, stop_line_number=5 returns exactly 5 lines.
+    Reads `file_path` from disk and returns lines from `start_line_number` through `stop_line_number` INCLUSIVE. Both bounds are 1-indexed (matching every other row value in this server). Asking for start_line_number=1, stop_line_number=5 returns exactly 5 lines.
 
     If `stop_line_number` is omitted or null, content from `start_line_number` through the end of the file .
 
@@ -578,7 +666,7 @@ def get_file_content(project_file: str, start_line_number: int,
     stop = int(stop_line_number) if stop_line_number is not None else None
     start = int(start_line_number)
 
-    with open(project_file, "r", encoding="utf-8", errors="replace") as f:
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         for lineno, line in enumerate(f, 1):
             total = lineno
             if lineno < start:
@@ -594,7 +682,7 @@ def get_file_content(project_file: str, start_line_number: int,
         end_line = start + len(sliced) - 1
 
     return {
-        "path": project_file,
+        "path": file_path,
         "start_line": start,
         "end_line": end_line,
         "total_lines": total,
@@ -602,7 +690,7 @@ def get_file_content(project_file: str, start_line_number: int,
     }
 
 
-def set_file_content(project_file: str, content: str,
+def set_file_content(file_path: str, content: str,
                      start_line_number: int,
                      stop_line_number: int,
                      save: bool = True) -> Dict[str, Any]:
@@ -612,7 +700,7 @@ def set_file_content(project_file: str, content: str,
     *   **Concurrency Safety:** When making multiple edits to the same file, always apply changes starting from the **highest line numbers first**. This prevents earlier edits from invalidating line numbers for subsequent operations.
 
     **Arguments:**
-    *   `project_file` (STRING): The absolute path to the file being edited.
+    *   `file_path` (STRING): The absolute path to the file being edited.
     *   `content` (STRING): The exact text you want to substitute for the selected lines. **Do not add automatic newlines.** If you need a newline at the end of your replacement block, include it in `content`. Passing an empty string (`""`) deletes all lines in the range.
     *   `start_line_number` (INTEGER): The first line number to replace/delete (inclusive). Must be $\\ge 1$.
     *   `stop_line_number` (INTEGER): The last line number to replace/delete (inclusive).
@@ -629,7 +717,7 @@ def set_file_content(project_file: str, content: str,
     if stop is not None and stop < start:
         raise ValueError("stop_line_number must be >= start_line_number")
 
-    view, was_open = _ensure_view(project_file)
+    view, was_open = _ensure_view(file_path)
 
     def apply():
         buf = view.substr(sublime.Region(0, view.size()))
@@ -1247,10 +1335,10 @@ def get_current_selections() -> Dict[str, Any]:
     character actually highlighted. So selecting visible content of lines
     3-5 always returns stop_line_number=5.
 
-    Untitled buffers: `project_file` is a display name like `<untitled 5>`
+    Untitled buffers: `file_path` is a display name like `<untitled 5>`
     and CANNOT be passed to file-oriented tools.
 
-    Returns: {project_file, project_file_total_lines, selections: [{start_line_number,
+    Returns: {file_path, file_total_lines, selections: [{start_line_number,
     stop_line_number, text}, ...]}.
 
     Also available as a chain pseudo-command inside `run_sublime_command`
@@ -1282,10 +1370,10 @@ def set_current_selection_content(content: str) -> Dict[str, Any]:
     If after the edit the buffer is dirty AND has a real on-disk file path,
     the file is saved automatically; otherwise the edit is left unsaved.
 
-    Untitled buffers are supported -- `project_file` will be a display name
+    Untitled buffers are supported -- `file_path` will be a display name
     like `<untitled 5>`.
 
-    Returns: {ok, project_file, replaced_start_line, replaced_stop_line,
+    Returns: {ok, file_path, replaced_start_line, replaced_stop_line,
     inserted_length, dirty, saved}. The reported line range is the PRE-edit
     range of the selection that was replaced (with the same column-0
     normalization as `get_current_selections`). `saved` is True if the file
@@ -1329,7 +1417,7 @@ def set_current_selection_content(content: str) -> Dict[str, Any]:
 
         return {
             "ok": True,
-            "project_file": name,
+            "file_path": name,
             "replaced_start_line": start_row + 1,
             "replaced_stop_line": end_row + 1,
             "inserted_length": len(content),
@@ -1582,7 +1670,7 @@ def run_sublime_command(commands: List[Dict[str, Any]]) -> Dict[str, Any]:
 # Grouped to match the section ordering above.
 TOOL_SPECS = [
     # 1. Project structure
-    (list_folders_in_project, 5.0),
+    (list_folders_in_project, 15.0),
     (find_files_in_project, 15.0),
 
     # 2. File content

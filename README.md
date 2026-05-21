@@ -25,15 +25,15 @@ Sublime's status bar.
 
 | Tool | What it does |
 |---|---|
-| `list_folders_in_project()` | Root folders + project file of the active ST window. |
+| `list_folders_in_project(glob?, max_results?)` | Full recursive folder list for the active project — roots **plus all subfolders** — honoring Sublime's folder excludes (`.git`, `node_modules`, etc. skipped). `glob` is an optional path glob scoping which folders return, matched relative to each root — same syntax as `find_files_in_project` (`application/**`, `src/*`, `**/migrations`). A scoped glob excludes the roots from `folders`, so read anchors from `roots`. Capped at `max_results` (default 200). Returns `{roots, folders, project_file, count, truncated}`. |
 | `find_files_in_project(pattern, regex?, glob?, max_results?)` | Find files across the project. `pattern` is fnmatched against the basename (or treated as a regex if `regex=true`); `glob` is a path glob (`application/**`, `src/**/*.test.ts`) restricting which directories to search. Capped at `max_results` (default 1000). Returns `{files, count, truncated}`. |
 
 ### File content
 
 | Tool | What it does |
 |---|---|
-| `get_file_content(project_file, start_line_number, stop_line_number?)` | Read a line-range slice of a file from disk. 1-indexed, inclusive. Omit `stop_line_number` to read through end-of-file. |
-| `set_file_content(project_file, content, start_line_number, stop_line_number?, save?)` | Replace a contiguous range of lines. Omit `stop_line_number` to replace through end-of-file. Single ST undo entry. |
+| `get_file_content(file_path, start_line_number, stop_line_number?)` | Read a line-range slice of a file from disk. 1-indexed, inclusive. Omit `stop_line_number` to read through end-of-file. |
+| `set_file_content(file_path, content, start_line_number, stop_line_number?, save?)` | Replace a contiguous range of lines. Omit `stop_line_number` to replace through end-of-file. Single ST undo entry. |
 
 ### Function / symbol
 

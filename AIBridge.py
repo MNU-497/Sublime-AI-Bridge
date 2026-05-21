@@ -17,7 +17,7 @@ from .tools.sublime_tools import register_all as register_all_tools
 
 
 SERVER_NAME = "sublime-ai-bridge"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "1.0.6"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
