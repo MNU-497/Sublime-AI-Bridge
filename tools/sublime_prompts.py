@@ -149,14 +149,43 @@ def _format_message(question, header_rows, lang, body_text):
     return "\n".join(lines)
 
 
+def _placeholder(question, note):
+    """Resolve a prompt successfully with an explanatory placeholder instead
+    of raising.
+
+    Some clients (Continue, etc.) call prompts/get eagerly -- e.g. when the
+    slash-menu loads -- before the user has selected anything or moved the
+    cursor into a function. Raising there surfaces a recurring error in the
+    client UI even though real invocations work. So when the precondition
+    isn't met we return a valid message carrying a clear note; the model sees
+    what happened and the client sees no error.
+    """
+    lines = []
+    if question and question.strip():
+        lines.append(question.strip())
+        lines.append("")
+    lines.append("_({})_".format(note))
+    return {
+        "description": note,
+        "messages": [
+            {"role": "user", "content": {"type": "text", "text": "\n".join(lines)}},
+        ],
+    }
+
+
 def selection(question: str = "") -> dict:
     """Insert the current Sublime selection into the prompt.
 
     Pairs the user's question (if any) with the active view's selected text,
     fenced with the buffer's syntax. If multiple regions are selected, they
-    are concatenated in document order.
+    are concatenated in document order. If there is no active view or nothing
+    is selected, resolves with an explanatory placeholder rather than raising
+    (clients fetch prompt content eagerly, before a selection exists).
     """
-    sel = _grab_selection()
+    try:
+        sel = _grab_selection()
+    except RuntimeError as e:
+        return _placeholder(question, str(e))
     header_rows = [
         ("File", sel["display"]),
         ("Lines", "{}-{} (of {})".format(
@@ -175,15 +204,22 @@ def function(question: str = "") -> dict:
     """Insert the function under the cursor into the prompt.
 
     Reads the active view's cursor row and pulls the enclosing function via
-    get_function_content (innermost match wins for nested defs). Errors if
-    the active view has no saved path, or if the cursor isn't inside a
-    recognized function/method.
+    get_function_content (innermost match wins for nested defs). If the active
+    view has no saved path, or the cursor isn't inside a recognized
+    function/method, resolves with an explanatory placeholder rather than
+    raising (clients fetch prompt content eagerly, before the cursor is parked
+    inside a function).
     """
-    file_path, row, lang = _grab_cursor_location()
+    try:
+        file_path, row, lang = _grab_cursor_location()
+    except RuntimeError as e:
+        return _placeholder(question, str(e))
+
     result = get_function_content(file_path=file_path, row=row)
     matches = result.get("matches") or []
     if not matches:
-        raise RuntimeError(
+        return _placeholder(
+            question,
             "cursor is not inside a recognized function (line {} of {})".format(
                 row, file_path))
 
