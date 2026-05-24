@@ -34,6 +34,7 @@ Sublime's status bar.
 |---|---|
 | `get_file_content(file_path, start_line_number, stop_line_number?)` | Read a line-range slice of a file from disk. 1-indexed, inclusive. Omit `stop_line_number` to read through end-of-file. |
 | `set_file_content(file_path, content, start_line_number, stop_line_number?, save?)` | Replace a contiguous range of lines. Omit `stop_line_number` to replace through end-of-file. Single ST undo entry. |
+| `apply_edits_to_file(file_path, edits[], save?)` | Apply many edits to one file as a single ST undo entry — all-or-nothing. Each entry in `edits` is `{type:"line_range", start_line, stop_line?, content}`, `{type:"row_col_range", start_row, start_column, end_row, end_column, content}`, or `{type:"find", find, replace, regex?, all?}`. All edit positions/patterns are resolved against the file's ORIGINAL content (no line-drift accounting needed); overlapping edits are rejected up front. Returns `{ok, file_path, edits_applied, dirty, details}`. |
 
 ### Function / symbol
 
@@ -61,8 +62,20 @@ Sublime's status bar.
 
 | Tool | What it does |
 |---|---|
+| `get_diagnostics(file_path?)` | LSP-derived diagnostics (errors, warnings, info, hints) for `file_path`, or every file the LSP package is tracking when omitted. Same content as the LSP panel and inline annotations. Each entry has file_path, 1-indexed row/column range, message, severity, source (LSP server name), and code; `counts` summarizes severity totals. Requires the [LSP package](https://lsp.sublimetext.io/); returns `lsp_available: false` with a note when it isn't installed. |
 | `get_current_selections()` | Return the active view's cursor/selection state with the file path and 1-indexed line ranges. |
 | `run_sublime_command(command, args?, file_path?)` | Run any Sublime Text command (formatters, sort, custom plugins). Escape hatch. |
+
+### Git
+
+Thin wrappers around the `git` binary, scoped to the active project's first folder (or to the file's enclosing repository when a `path`/`file_path` is supplied). `git` must be on PATH. Args that look like options (start with `-`) are rejected to prevent option-injection.
+
+| Tool | What it does |
+|---|---|
+| `git_log(path?, max_results?, since?, ref?)` | Recent commits as `{commits: [{hash, short_hash, author, email, date, subject, body}, ...], count}`. `path` scopes to one file/dir; `max_results` defaults to 20; `since` is a git date string ("2 weeks ago", "2026-01-01"); `ref` selects a branch/tag (default HEAD). |
+| `git_show(ref, path?, max_diff_bytes?)` | Inspect a commit (`{hash, author, email, date, subject, body, diff, diff_truncated, diff_total_bytes}`) — or, with `path`, return the file's content at that commit (`{ref, path, content, truncated, total_bytes}`). |
+| `git_diff(base?, head?, path?, staged?, max_bytes?)` | Diff output. No `base`/`head`: working tree vs index (or vs HEAD if `staged=true`). With `base` only: working tree vs `base`. With both: `base..head`. `path` scopes. Returns `{diff, truncated, total_bytes}`. |
+| `git_blame(file_path, line)` | Blame for a single 1-indexed `line`. Returns `{file_path, line, hash, short_hash, author, author_email, author_time, summary, previous_hash, line_content}`. |
 
 ## Resources (@-mention from your chat)
 

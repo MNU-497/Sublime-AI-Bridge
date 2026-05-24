@@ -14,6 +14,9 @@ from .mcp_lite.transport_http import HTTPTransport
 from .tools.sublime_prompts import register_all as register_all_prompts
 from .tools.sublime_resources import register_all as register_all_resources
 from .tools.sublime_tools import register_all as register_all_tools
+# Re-export TextCommand classes so Sublime's plugin scanner (which only walks
+# the top-level package files) discovers and registers them.
+from .tools.sublime_tools import AiBridgeApplyEditsCommand  # noqa: F401
 
 
 SERVER_NAME = "sublime-ai-bridge"

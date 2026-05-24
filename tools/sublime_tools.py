@@ -13,14 +13,17 @@ response, and is intentionally grouped:
   4. Text search
   5. Editor state
 """
+import datetime
 import fnmatch
 import os
 import re
+import subprocess
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
 import sublime
+import sublime_plugin
 
 from ..mcp_lite.server import is_cancelled
 
@@ -796,6 +799,185 @@ def set_file_content(file_path: str, content: str,
     return _on_main(apply)
 
 
+class AiBridgeApplyEditsCommand(sublime_plugin.TextCommand):
+    """Replace a set of regions in the active view in a single edit token.
+
+    `prepared` is a list of [start_pt, end_pt, content] triples, expected to
+    be sorted in DESCENDING start-point order so that applying them in
+    sequence doesn't shift the offsets of later (lower-position) edits. The
+    caller (apply_edits_to_file) does the sort + validation before calling.
+
+    Wrapping all replace() calls in one TextCommand keeps them in a single
+    Sublime undo entry — Ctrl+Z reverts every edit at once.
+    """
+
+    def run(self, edit, prepared):
+        for entry in prepared:
+            start, end, content = entry
+            self.view.replace(edit, sublime.Region(int(start), int(end)), content)
+
+
+def apply_edits_to_file(file_path: str, edits: List[Dict[str, Any]],
+                        save: bool = False) -> Dict[str, Any]:
+    """Apply multiple edits to a single file atomically -- one undo entry,
+    all-or-nothing.
+
+    `edits[]` mixes three kinds:
+      * {type:"line_range", start_line, stop_line?, content} -- replace a
+        1-indexed inclusive line range; omit stop_line for through-EOF.
+      * {type:"row_col_range", start_row, start_column, end_row, end_column,
+        content} -- precise 1-indexed character replacement.
+      * {type:"find", find, replace, regex?, all?} -- exact-string or regex
+        replace; all=true (default) replaces every match, all=false only the
+        first.
+
+    All edit positions/patterns are resolved against the file's ORIGINAL
+    content (not sequentially), so the caller doesn't have to track
+    line-number drift. Overlapping edits are rejected up-front; on rejection
+    no edit is applied.
+
+    `save` defaults to False; if the file wasn't already open the bridge
+    force-saves anyway (so edits don't evaporate when the transient view
+    closes). Returns: {ok, file_path, edits_applied, dirty, details}.
+    """
+    if not isinstance(edits, list) or not edits:
+        raise ValueError("edits must be a non-empty list")
+
+    view, was_open = _ensure_view(file_path)
+
+    def prep():
+        buf = view.substr(sublime.Region(0, view.size()))
+        total_lines = view.rowcol(view.size())[0] + 1
+        prepared = []
+        details = []
+
+        for i, e in enumerate(edits):
+            etype = e.get("type")
+            label = "edit[{}] type={}".format(i, etype)
+
+            if etype == "line_range":
+                start_line = int(e["start_line"])
+                stop_line = e.get("stop_line")
+                start_row = start_line - 1
+                if start_row >= total_lines:
+                    raise ValueError(
+                        "{}: start_line {} > total lines {}".format(
+                            label, start_line, total_lines))
+                start_pt = view.text_point(start_row, 0)
+                if stop_line is None:
+                    end_pt = view.size()
+                else:
+                    stop_row = min(int(stop_line) - 1, total_lines - 1)
+                    # Consume the trailing newline (if any) of the stop row so
+                    # the line structure is preserved across the replacement.
+                    if stop_row + 1 < total_lines:
+                        end_pt = view.text_point(stop_row + 1, 0)
+                    else:
+                        end_pt = view.size()
+                content = e.get("content", "")
+                if stop_line is not None and content and not content.endswith("\n") and end_pt < view.size():
+                    content = content + "\n"
+                prepared.append((start_pt, end_pt, content))
+                details.append({"spec_index": i, "type": etype})
+
+            elif etype == "row_col_range":
+                start_row = int(e["start_row"]) - 1
+                start_col = int(e["start_column"]) - 1
+                end_row = int(e["end_row"]) - 1
+                end_col = int(e["end_column"]) - 1
+                if start_row >= total_lines or end_row >= total_lines:
+                    raise ValueError(
+                        "{}: row out of bounds (file has {} lines)".format(
+                            label, total_lines))
+                start_pt = view.text_point(start_row, start_col)
+                end_pt = view.text_point(end_row, end_col)
+                if start_pt > end_pt:
+                    raise ValueError(
+                        "{}: start position is after end position".format(label))
+                prepared.append((start_pt, end_pt, e.get("content", "")))
+                details.append({"spec_index": i, "type": etype})
+
+            elif etype == "find":
+                find_str = e["find"]
+                replace_str = e.get("replace", "")
+                use_regex = bool(e.get("regex", False))
+                find_all = e.get("all", True)
+
+                spans = []  # list of (start, end)
+                if use_regex:
+                    try:
+                        pat = re.compile(find_str)
+                    except re.error as ex:
+                        raise ValueError("{}: invalid regex: {}".format(label, ex))
+                    for m in pat.finditer(buf):
+                        spans.append((m.start(), m.end()))
+                        if not find_all:
+                            break
+                else:
+                    pos = 0
+                    while True:
+                        idx = buf.find(find_str, pos)
+                        if idx == -1:
+                            break
+                        spans.append((idx, idx + len(find_str)))
+                        if not find_all:
+                            break
+                        pos = idx + max(1, len(find_str))
+
+                if not spans:
+                    raise ValueError(
+                        "{}: no matches for {}: {}".format(
+                            label, "regex" if use_regex else "string", find_str))
+
+                for s, en in spans:
+                    prepared.append((s, en, replace_str))
+                details.append({"spec_index": i, "type": etype, "matches": len(spans)})
+
+            else:
+                raise ValueError("{}: unknown edit type".format(label))
+
+        # Overlap check (after sorting by start).
+        ordered = sorted(prepared, key=lambda p: p[0])
+        for j in range(1, len(ordered)):
+            prev_s, prev_e, _ = ordered[j - 1]
+            cur_s, cur_e, _ = ordered[j]
+            if cur_s < prev_e:
+                raise ValueError(
+                    "overlapping edits at points {}-{} and {}-{}".format(
+                        prev_s, prev_e, cur_s, cur_e))
+
+        # Sort DESCENDING so applying in sequence inside the TextCommand
+        # doesn't shift the offsets of later (lower-position) edits.
+        return sorted(prepared, key=lambda p: p[0], reverse=True), details
+
+    prepared, details = _on_main(prep)
+
+    def apply():
+        view.run_command(
+            "ai_bridge_apply_edits",
+            {"prepared": [[s, e, c] for s, e, c in prepared]},
+        )
+        return view.is_dirty()
+
+    dirty = _on_main(apply)
+
+    # Sublime parity with set_file_content / set_function_content: if the
+    # file wasn't already open, force-save so the edit doesn't evaporate
+    # when the transient view closes.
+    should_save = save or not was_open
+    if should_save:
+        _on_main(lambda: view.run_command("save"))
+        dirty = _on_main(lambda: view.is_dirty())
+
+    return {
+        "ok": True,
+        "file_path": file_path,
+        "edits_applied": len(prepared),
+        "dirty": dirty,
+        "details": details,
+    }
+
+
 # ============================================================================
 # 3. Function / symbol
 #
@@ -1321,6 +1503,280 @@ def search_text_in_open_files(pattern: str, regex: bool = True, case_sensitive: 
 # 5. Editor state
 # ============================================================================
 
+# LSP severity numbers per the LSP spec (NOT VS Code's enum, which is
+# off-by-one): 1=Error, 2=Warning, 3=Information, 4=Hint.
+_LSP_SEVERITY = {1: "error", 2: "warning", 3: "info", 4: "hint"}
+
+
+def _uri_to_filename_safe(uri):
+    """Best-effort URI -> filesystem path conversion. Tries LSP's helpers in
+    order, falling back to the raw URI string if nothing imports."""
+    try:
+        from LSP.plugin.core.url import uri_to_filename
+        return uri_to_filename(uri)
+    except Exception:
+        pass
+    try:
+        from LSP.plugin.core.url import parse_uri
+        _scheme, path = parse_uri(uri)
+        return path
+    except Exception:
+        return uri
+
+
+def _looks_like_diagnostic(obj):
+    """A real LSP Diagnostic always has at least a `message` or `range`.
+    Anything missing both is probably a key/version-id we wrongly iterated."""
+    if isinstance(obj, dict):
+        return ("message" in obj) or ("range" in obj)
+    return hasattr(obj, "message") or hasattr(obj, "range")
+
+
+def _flatten_diagnostics(obj):
+    """Coerce whatever the LSP package's storage gives us into a flat list of
+    Diagnostic objects. Different LSP releases have stored diagnostics as:
+      - List[Diagnostic]                                 (older)
+      - Dict[source_or_version_id, List[Diagnostic]]     (newer, per-URI)
+      - Dict[uri, ...]                                   (whole-storage)
+    We walk dicts by value and lists element-wise, only emitting items that
+    look like diagnostics."""
+    if obj is None:
+        return []
+    if _looks_like_diagnostic(obj):
+        return [obj]
+    if isinstance(obj, dict):
+        out = []
+        for v in obj.values():
+            out.extend(_flatten_diagnostics(v))
+        return out
+    try:
+        items = list(obj)
+    except TypeError:
+        return []
+    out = []
+    for item in items:
+        out.extend(_flatten_diagnostics(item))
+    return out
+
+
+def _format_lsp_diag(d, file_path, source):
+    """Normalize an LSP Diagnostic (dict or dataclass-ish) to our wire shape."""
+    def _get(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    rng = _get(d, "range", {}) or {}
+    start = _get(rng, "start", {}) or {}
+    end = _get(rng, "end", {}) or {}
+    sev_num = _get(d, "severity", 1) or 1
+    sev = _LSP_SEVERITY.get(sev_num, "info")
+
+    code = _get(d, "code", None)
+    # LSP allows code to be an int, string, or {value, target}-style object.
+    if isinstance(code, dict):
+        code = code.get("value")
+
+    return {
+        "file_path": file_path,
+        "severity": sev,
+        "row": int(_get(start, "line", 0) or 0) + 1,
+        "column": int(_get(start, "character", 0) or 0) + 1,
+        "end_row": int(_get(end, "line", 0) or 0) + 1,
+        "end_column": int(_get(end, "character", 0) or 0) + 1,
+        "message": _get(d, "message", "") or "",
+        "source": _get(d, "source", None) or source,
+        "code": code,
+    }
+
+
+def get_diagnostics(file_path: Optional[str] = None,
+                    debug: bool = False) -> Dict[str, Any]:
+    """Return language-server diagnostics (errors, warnings, info, hints) for
+    `file_path`, or for every file currently tracked by the LSP package if
+    `file_path` is omitted.
+
+    Sublime Text has no native "Problems" panel; diagnostics are owned by the
+    LSP package (sublimelsp/LSP). Same content the LSP panel and inline
+    annotations display -- whatever the active language servers (Intelephense
+    for PHP, pyright for Python, etc.) have published.
+
+    Each entry has file_path, 1-indexed row/column range, message, severity
+    ("error" | "warning" | "info" | "hint"), source (LSP server name), and
+    code. `counts` summarizes severity totals across the returned set.
+
+    Pass `debug=true` to include a `_debug` block describing the LSP storage
+    shape (session names, URI keys, storage types) -- useful when a file
+    that visibly has diagnostics in the LSP panel returns empty here.
+
+    If the LSP package isn't installed, returns successfully with an empty
+    list, `lsp_available: false`, and a `note` explaining why -- no exception,
+    so clients that poll this tool don't surface a recurring error.
+
+    SublimeLinter (a separate diagnostic provider) is NOT queried; only LSP.
+    """
+    return _on_main(lambda: _gather_diagnostics(file_path, debug))
+
+
+def _gather_diagnostics(file_path, debug=False):
+    empty = {
+        "diagnostics": [],
+        "counts": {"error": 0, "warning": 0, "info": 0, "hint": 0},
+        "lsp_available": False,
+    }
+
+    # Import lazily so the bridge still loads when LSP isn't installed.
+    try:
+        from LSP.plugin.core.url import filename_to_uri  # noqa: F401
+    except ImportError:
+        return dict(empty, note="LSP package not installed; no diagnostics available.")
+
+    sublime_window = sublime.active_window()
+    if sublime_window is None:
+        return dict(empty, lsp_available=True, note="no active Sublime window")
+
+    # Find the WindowManager. The LSP package has shuffled this import path
+    # over releases; try the current location, then a few fallbacks.
+    wm = None
+    try:
+        from LSP.plugin.core.registry import windows as _windows
+        wm = _windows.lookup(sublime_window)
+    except Exception:
+        pass
+    if wm is None:
+        try:
+            from LSP.plugin.core.windows import WindowRegistry
+            wm = WindowRegistry().lookup(sublime_window)
+        except Exception:
+            pass
+    if wm is None:
+        return dict(empty, lsp_available=True,
+                    note="could not access LSP WindowManager (LSP API moved?)")
+
+    # Enumerate sessions.
+    if hasattr(wm, "get_sessions"):
+        sessions = list(wm.get_sessions())
+    elif hasattr(wm, "_sessions"):
+        sessions = list(wm._sessions)
+    else:
+        sessions = []
+
+    if not sessions:
+        return dict(empty, lsp_available=True,
+                    note="no active LSP sessions in this window")
+
+    target_uri = None
+    if file_path:
+        from LSP.plugin.core.url import filename_to_uri
+        target_uri = filename_to_uri(file_path)
+
+    results = []
+    debug_info = {
+        "target_uri": target_uri,
+        "session_count": len(sessions),
+        "sessions": [],
+    } if debug else None
+
+    for session in sessions:
+        source = (getattr(getattr(session, "config", None), "name", None)
+                  or "lsp")
+        storage = getattr(session, "diagnostics", None)
+        if storage is None:
+            if debug_info is not None:
+                debug_info["sessions"].append({
+                    "name": source,
+                    "storage": None,
+                })
+            continue
+
+        # Best-effort introspection of the storage shape for debug mode.
+        sess_dbg = None
+        if debug_info is not None:
+            sess_dbg = {
+                "name": source,
+                "storage_type": type(storage).__name__,
+                "storage_methods": [
+                    m for m in (
+                        "diagnostics_by_document_uri", "_diagnostics",
+                        "diagnostics_async", "__iter__",
+                    ) if hasattr(storage, m)
+                ],
+                "uri_keys_sample": [],
+                "raw_target_type": None,
+                "raw_target_repr": None,
+            }
+            # Try to list URI keys so we can compare against target_uri.
+            try:
+                if hasattr(storage, "__iter__"):
+                    keys = []
+                    for i, entry in enumerate(storage):
+                        if isinstance(entry, tuple) and len(entry) >= 1:
+                            keys.append(str(entry[0]))
+                        else:
+                            keys.append(str(entry))
+                        if i >= 19:
+                            break
+                    sess_dbg["uri_keys_sample"] = keys
+                elif hasattr(storage, "_diagnostics"):
+                    sess_dbg["uri_keys_sample"] = [
+                        str(k) for k in list(storage._diagnostics.keys())[:20]
+                    ]
+            except Exception as e:
+                sess_dbg["uri_keys_sample"] = ["<error: {}>".format(e)]
+
+        if target_uri:
+            raw = None
+            try:
+                if hasattr(storage, "diagnostics_by_document_uri"):
+                    raw = storage.diagnostics_by_document_uri(target_uri)
+                elif hasattr(storage, "_diagnostics"):
+                    raw = storage._diagnostics.get(target_uri)
+            except Exception:
+                raw = None
+            if sess_dbg is not None:
+                sess_dbg["raw_target_type"] = type(raw).__name__
+                try:
+                    sess_dbg["raw_target_repr"] = repr(raw)[:400]
+                except Exception:
+                    sess_dbg["raw_target_repr"] = "<unreprable>"
+            for d in _flatten_diagnostics(raw):
+                results.append(_format_lsp_diag(d, file_path, source))
+        else:
+            # Iterate every URI the storage knows about. Different LSP
+            # versions expose iteration differently; cover the common ones.
+            items = []
+            try:
+                if hasattr(storage, "__iter__"):
+                    items = list(storage)  # expected: [(uri, ds), ...]
+                elif hasattr(storage, "_diagnostics"):
+                    items = list(storage._diagnostics.items())
+            except Exception:
+                items = []
+            for entry in items:
+                if not (isinstance(entry, tuple) and len(entry) == 2):
+                    continue
+                uri, ds = entry
+                fp = _uri_to_filename_safe(uri)
+                for d in _flatten_diagnostics(ds):
+                    results.append(_format_lsp_diag(d, fp, source))
+
+        if debug_info is not None and sess_dbg is not None:
+            debug_info["sessions"].append(sess_dbg)
+
+    counts = {"error": 0, "warning": 0, "info": 0, "hint": 0}
+    for r in results:
+        counts[r["severity"]] = counts.get(r["severity"], 0) + 1
+
+    out = {
+        "diagnostics": results,
+        "counts": counts,
+        "lsp_available": True,
+    }
+    if debug_info is not None:
+        out["_debug"] = debug_info
+    return out
+
+
 def get_current_selections() -> Dict[str, Any]:
     """Return the current text selections in the active Sublime view.
 
@@ -1662,6 +2118,295 @@ def run_sublime_command(commands: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ============================================================================
+# 6. Git
+# ============================================================================
+# Thin wrappers around the `git` binary. Run via subprocess with args as a
+# list (no shell) so there's no shell injection. Refs and paths that start
+# with "-" are rejected to prevent git option-injection. git is expected on
+# PATH; if missing, callers see a clear "command not found" error.
+
+GIT_DEFAULT_LOG_MAX = 20
+GIT_DEFAULT_DIFF_MAX_BYTES = 200_000
+GIT_SUBPROCESS_TIMEOUT = 20.0  # seconds
+
+
+def _resolve_git_cwd(file_path=None):
+    """Always cwd into the project's first folder so git can find .git
+    deterministically. If `file_path` is given, also resolve it to an
+    absolute path against that root (relative paths from the LLM survive
+    the cwd hop and remain meaningful to git).
+
+    Returns (cwd, abs_path_or_none).
+    """
+    def get():
+        w = sublime.active_window()
+        if w is None:
+            return None
+        folders = w.folders()
+        return folders[0] if folders else None
+    root = _on_main(get)
+    if root is None:
+        raise RuntimeError("no project folder open")
+    if file_path is None:
+        return root, None
+    abs_path = file_path if os.path.isabs(file_path) else os.path.normpath(
+        os.path.join(root, file_path))
+    return root, abs_path
+
+
+def _assert_safe_ref(value, label):
+    if isinstance(value, str) and value.startswith("-"):
+        raise ValueError(
+            "refusing {} starting with '-' (option injection risk): {}".format(
+                label, value))
+
+
+def _run_git(args, cwd):
+    if not os.path.isdir(cwd):
+        # Caught up-front so the FileNotFoundError below would otherwise
+        # report it as a missing `git` binary, which it isn't.
+        raise RuntimeError("working directory not found: {}".format(cwd))
+    try:
+        result = subprocess.run(
+            ["git"] + args,
+            cwd=cwd,
+            capture_output=True,
+            timeout=GIT_SUBPROCESS_TIMEOUT,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("`git` is not installed or not on PATH")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            "git {} timed out after {}s".format(args[0], GIT_SUBPROCESS_TIMEOUT))
+    if result.returncode != 0:
+        stderr = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            "git {} failed: {}".format(" ".join(args[:2]), stderr or "exit {}".format(result.returncode)))
+    return (result.stdout or b"").decode("utf-8", errors="replace")
+
+
+def git_log(path: Optional[str] = None, max_results: int = GIT_DEFAULT_LOG_MAX,
+            since: Optional[str] = None, ref: Optional[str] = None
+            ) -> Dict[str, Any]:
+    """Return recent commits from the workspace's git repository.
+
+    Optional `path` scopes the log to a single file or directory.
+    `max_results` caps the number of commits (default 20).
+    `since` is a git-style date filter (e.g. "2 weeks ago", "2026-01-01").
+    `ref` selects a branch/tag (default HEAD).
+
+    Returns: {commits: [{hash, short_hash, author, email, date, subject,
+    body}, ...], count}.
+    """
+    cwd, abs_path = _resolve_git_cwd(path)
+    max_n = int(max_results) if max_results is not None else GIT_DEFAULT_LOG_MAX
+    fmt = "\x1f".join(["%H", "%h", "%an", "%ae", "%aI", "%s", "%b"])
+    args = ["log", "-n{}".format(max_n), "--no-color",
+            "--pretty=format:{}%x1e".format(fmt)]
+    if since:
+        args.append("--since={}".format(since))
+    if ref:
+        _assert_safe_ref(ref, "ref")
+        args.append(ref)
+    if abs_path:
+        args.append("--")
+        args.append(abs_path)
+
+    out = _run_git(args, cwd)
+    records = [r for r in out.split("\x1e") if r.strip()]
+    commits = []
+    for rec in records:
+        parts = rec.split("\x1f")
+        while len(parts) < 7:
+            parts.append("")
+        h, sh, au, em, dt, sub = parts[:6]
+        body = "\x1f".join(parts[6:]).rstrip()
+        commits.append({
+            "hash": h.strip(),
+            "short_hash": sh,
+            "author": au,
+            "email": em,
+            "date": dt,
+            "subject": sub,
+            "body": body,
+        })
+    return {"commits": commits, "count": len(commits)}
+
+
+def git_show(ref: str, path: Optional[str] = None,
+             max_diff_bytes: int = GIT_DEFAULT_DIFF_MAX_BYTES
+             ) -> Dict[str, Any]:
+    """Inspect a commit OR a file's content at a specific ref.
+
+    Without `path`: returns {hash, author, email, date, subject, body, diff,
+    diff_truncated, diff_total_bytes} for the commit.
+    With `path`: returns {ref, path, content, truncated, total_bytes} -- the
+    file's content as of that commit.
+
+    `ref` accepts a commit hash, branch, or tag. `max_diff_bytes` caps the
+    diff or file size (default 200000).
+    """
+    _assert_safe_ref(ref, "ref")
+    if path and path.startswith("-"):
+        raise ValueError("refusing path starting with '-': {}".format(path))
+    cwd, abs_path = _resolve_git_cwd(path)
+    cap = int(max_diff_bytes) if max_diff_bytes is not None else GIT_DEFAULT_DIFF_MAX_BYTES
+
+    if abs_path:
+        # `git show REF:PATH` requires PATH relative to the repo root.
+        rel_path = abs_path
+        try:
+            top = _run_git(["rev-parse", "--show-toplevel"], cwd).strip()
+            if top:
+                rel_path = os.path.relpath(abs_path, top).replace(os.sep, "/")
+        except Exception:
+            pass
+        content = _run_git(["show", "{}:{}".format(ref, rel_path)], cwd)
+        total = len(content.encode("utf-8"))
+        truncated = total > cap
+        return {
+            "ref": ref,
+            "path": path,
+            "content": content[:cap] if truncated else content,
+            "truncated": truncated,
+            "total_bytes": total,
+        }
+
+    meta_fmt = "\x1f".join(["%H", "%an", "%ae", "%aI", "%s", "%b"])
+    meta = _run_git(
+        ["show", "-s", "--no-color", "--pretty=format:{}".format(meta_fmt), ref],
+        cwd)
+    meta_parts = meta.split("\x1f")
+    while len(meta_parts) < 6:
+        meta_parts.append("")
+    h, au, em, dt, sub = meta_parts[:5]
+    body = "\x1f".join(meta_parts[5:]).rstrip()
+
+    diff = _run_git(["show", "--no-color", "--format=", ref], cwd)
+    total = len(diff.encode("utf-8"))
+    truncated = total > cap
+    return {
+        "hash": h.strip(),
+        "author": au,
+        "email": em,
+        "date": dt,
+        "subject": sub,
+        "body": body,
+        "diff": diff[:cap] if truncated else diff,
+        "diff_truncated": truncated,
+        "diff_total_bytes": total,
+    }
+
+
+def git_diff(base: Optional[str] = None, head: Optional[str] = None,
+             path: Optional[str] = None, staged: bool = False,
+             max_bytes: int = GIT_DEFAULT_DIFF_MAX_BYTES
+             ) -> Dict[str, Any]:
+    """Return git diff output.
+
+    With no `base`/`head`: working-tree diff vs index (pass `staged=true` for
+    index-vs-HEAD).
+    With `base` only: working tree vs `base`.
+    With `base` AND `head`: diff between two refs (`base..head`).
+    Optional `path` scopes the diff.
+
+    `max_bytes` caps the output (default 200000); `truncated` is true if the
+    cap was hit. Returns: {diff, truncated, total_bytes}.
+    """
+    if base:
+        _assert_safe_ref(base, "base")
+    if head:
+        _assert_safe_ref(head, "head")
+    if path and path.startswith("-"):
+        raise ValueError("refusing path starting with '-': {}".format(path))
+    cwd, abs_path = _resolve_git_cwd(path)
+    cap = int(max_bytes) if max_bytes is not None else GIT_DEFAULT_DIFF_MAX_BYTES
+    args = ["diff", "--no-color"]
+    if staged:
+        args.append("--cached")
+    if base and head:
+        args.append("{}..{}".format(base, head))
+    elif base:
+        args.append(base)
+    if abs_path:
+        args.append("--")
+        args.append(abs_path)
+    out = _run_git(args, cwd)
+    total = len(out.encode("utf-8"))
+    truncated = total > cap
+    return {
+        "diff": out[:cap] if truncated else out,
+        "truncated": truncated,
+        "total_bytes": total,
+    }
+
+
+def git_blame(file_path: str, line: int) -> Dict[str, Any]:
+    """Return blame info for a single 1-indexed line in `file_path`.
+
+    Returns: {file_path, line, hash, short_hash, author, author_email,
+    author_time, summary, previous_hash, line_content}.
+    """
+    if file_path.startswith("-"):
+        raise ValueError("refusing file_path starting with '-': {}".format(file_path))
+    line_n = int(line)
+    if line_n < 1:
+        raise ValueError("line must be >= 1")
+    cwd, abs_path = _resolve_git_cwd(file_path)
+    out = _run_git(
+        ["blame", "--porcelain", "-L{},{}".format(line_n, line_n),
+         "--", abs_path],
+        cwd)
+    lines = out.split("\n")
+    if not lines:
+        raise RuntimeError("git blame produced no output")
+
+    # Porcelain format: first line is "<hash> <orig> <final> <count>", then
+    # header lines like "author <name>", "author-mail <<email>>",
+    # "author-time <unix>", "summary <text>", optionally "previous <hash> <path>",
+    # ending with one tab-prefixed content line.
+    head_parts = lines[0].split(" ")
+    commit_hash = head_parts[0].strip() if head_parts else ""
+    info = {}
+    content = ""
+    for raw in lines[1:]:
+        if raw.startswith("\t"):
+            content = raw[1:]
+            break
+        sp = raw.find(" ")
+        if sp == -1:
+            continue
+        info[raw[:sp]] = raw[sp + 1:]
+
+    author_time = None
+    if info.get("author-time"):
+        try:
+            author_time = datetime.datetime.fromtimestamp(
+                int(info["author-time"]), tz=datetime.timezone.utc
+            ).isoformat()
+        except (ValueError, OverflowError):
+            author_time = None
+    previous_hash = None
+    if info.get("previous"):
+        previous_hash = info["previous"].split(" ")[0]
+    author_email = (info.get("author-mail") or "").strip("<>")
+
+    return {
+        "file_path": file_path,
+        "line": line_n,
+        "hash": commit_hash,
+        "short_hash": commit_hash[:7],
+        "author": info.get("author", ""),
+        "author_email": author_email,
+        "author_time": author_time,
+        "summary": info.get("summary", ""),
+        "previous_hash": previous_hash,
+        "line_content": content,
+    }
+
+
+# ============================================================================
 # Registration
 # ============================================================================
 
@@ -1676,6 +2421,7 @@ TOOL_SPECS = [
     # 2. File content
     (get_file_content, 5.0),
     (set_file_content, 15.0),
+    (apply_edits_to_file, 20.0),
 
     # 3. Function / symbol
     (find_function_in_project, 5.0),
@@ -1689,9 +2435,16 @@ TOOL_SPECS = [
     (search_text_in_open_files, 5.0),
 
     # 5. Editor state
+    (get_diagnostics, 5.0),
     (get_current_selections, 5.0),
     (set_current_selection_content, 5.0),
     (run_sublime_command, 10.0),
+
+    # 6. Git
+    (git_log, 20.0),
+    (git_show, 20.0),
+    (git_diff, 20.0),
+    (git_blame, 20.0),
 ]
 
 
