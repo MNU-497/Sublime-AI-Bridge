@@ -1906,11 +1906,13 @@ def _lsp_unavailable_envelope(file_path, row, column, message, extra):
     return payload
 
 
-def get_definition(file_path: str, row: int, column: int) -> Dict[str, Any]:
+def get_symbol_definition_at(file_path: str, row: int, column: int
+                             ) -> Dict[str, Any]:
     """Resolve where the symbol at (`row`, `column`) in `file_path` is
-    declared — same as Sublime LSP's 'Go to Definition'.
+    declared — same as Sublime LSP's 'Go to Definition' (works on any
+    symbol kind: functions, classes, variables, properties, types).
 
-    Position-based: unlike `find_function_in_project` (name-based, returns
+    Position-based: unlike `find_function_in_project` (NAME-based, returns
     every same-named symbol across the project), this uses the language
     server's scope/import knowledge to give one precise answer.
 
@@ -1956,10 +1958,11 @@ def get_definition(file_path: str, row: int, column: int) -> Dict[str, Any]:
     }
 
 
-def get_hover(file_path: str, row: int, column: int) -> Dict[str, Any]:
+def get_symbol_info_at(file_path: str, row: int, column: int) -> Dict[str, Any]:
     """Get LSP hover info -- type signature, docstring, deprecation notes --
-    for the symbol at (`row`, `column`) in `file_path`. Cheaper than
-    `get_function_content` when you only need the signature + docs.
+    for the symbol at (`row`, `column`) in `file_path` (works on any symbol
+    kind). Cheaper than `get_function_content` when you only need the
+    signature + docs.
 
     Returns: {file_path, row, column, contents (markdown string or null),
     lsp_available}.
@@ -2707,8 +2710,8 @@ TOOL_SPECS = [
     (list_functions_in_file, 10.0),
     (get_function_content, 10.0),
     (set_function_content, 15.0),
-    (get_definition, 10.0),
-    (get_hover, 10.0),
+    (get_symbol_definition_at, 10.0),
+    (get_symbol_info_at, 10.0),
 
     # 4. Text search
     (search_text_in_project, 30.0),
