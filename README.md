@@ -50,6 +50,8 @@ Sublime's status bar.
 | `list_functions_in_file(file_path)` | List all symbols in a single file. |
 | `get_function_content(file_path, name, row?)` | Return the full source text of a definition (signature through closing brace). |
 | `set_function_content(file_path, name, new_text, save?, row?)` | Replace an entire definition with `new_text`. Single undo entry. |
+| `get_definition(file_path, row, column)` | POSITION-based 'Go to Definition' via the LSP package — the language server's scope-aware resolution gives a single precise answer (vs. `find_function_in_project`'s name-based, possibly-ambiguous matches). Returns `{file_path, row, column, locations: [{file_path, row, column, end_row, end_column}, ...], count, lsp_available}`. Returns `lsp_available: false` with a note if no LSP session can serve the request. |
+| `get_hover(file_path, row, column)` | POSITION-based hover info via the LSP package — type signature, docstring, deprecation notes — cheaper than fetching the full function body when you only need the signature. Returns `{file_path, row, column, contents (markdown string or null), lsp_available}`. Returns `lsp_available: false` with a note if no LSP session can serve it. |
 
 ### Text search
 

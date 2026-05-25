@@ -23,7 +23,6 @@ import time
 from typing import Any, Dict, List, Optional
 
 import sublime
-import sublime_plugin
 
 from ..mcp_lite.server import is_cancelled
 
@@ -799,22 +798,15 @@ def set_file_content(file_path: str, content: str,
     return _on_main(apply)
 
 
-class AiBridgeApplyEditsCommand(sublime_plugin.TextCommand):
-    """Replace a set of regions in the active view in a single edit token.
-
-    `prepared` is a list of [start_pt, end_pt, content] triples, expected to
-    be sorted in DESCENDING start-point order so that applying them in
-    sequence doesn't shift the offsets of later (lower-position) edits. The
-    caller (apply_edits_to_file) does the sort + validation before calling.
-
-    Wrapping all replace() calls in one TextCommand keeps them in a single
-    Sublime undo entry — Ctrl+Z reverts every edit at once.
-    """
-
-    def run(self, edit, prepared):
-        for entry in prepared:
-            start, end, content = entry
-            self.view.replace(edit, sublime.Region(int(start), int(end)), content)
+# The AiBridgeApplyEditsCommand TextCommand that backs apply_edits_to_file
+# lives in AIBridge.py (the top-level package file) rather than here.
+# Sublime's plugin scanner only walks top-level package files when
+# registering sublime_plugin.* subclasses — defining the command in a
+# subpackage (here) and re-exporting it from the top level is NOT enough;
+# Sublime tracks the class's defining module, not where it was imported.
+# tools/sublime_tools.py only needs to reference the command BY NAME via
+# view.run_command("ai_bridge_apply_edits", ...) — which is what
+# apply_edits_to_file does above.
 
 
 def apply_edits_to_file(file_path: str, edits: List[Dict[str, Any]],
@@ -953,9 +945,16 @@ def apply_edits_to_file(file_path: str, edits: List[Dict[str, Any]],
     prepared, details = _on_main(prep)
 
     def apply():
+        # The package's ai_bridge_apply_edits TextCommand (defined at top
+        # level in AIBridge.py and shared with set_file_content /
+        # set_current_selection_content) takes `edits` as a list of
+        # {start, end, text} dicts using absolute character offsets. It
+        # sorts in reverse internally before applying. We still do our own
+        # overlap check + (now redundant) reverse-sort in `prep` above, so
+        # this just maps our triples onto the documented schema.
         view.run_command(
             "ai_bridge_apply_edits",
-            {"prepared": [[s, e, c] for s, e, c in prepared]},
+            {"edits": [{"start": s, "end": e, "text": c} for s, e, c in prepared]},
         )
         return view.is_dirty()
 
@@ -1777,6 +1776,285 @@ def _gather_diagnostics(file_path, debug=False):
     return out
 
 
+# ---------------------------------------------------------------------------
+# LSP position-based queries (definition, hover)
+# ---------------------------------------------------------------------------
+
+LSP_REQUEST_TIMEOUT = 10.0  # seconds
+
+
+def _lsp_position_request_sync(file_path, row, column, lsp_method,
+                                capability_key, request_builder):
+    """Send a position-based LSP request to the first session in the active
+    window that has the requested capability; wait synchronously for the
+    response.
+
+    Raises a marker RuntimeError prefixed with 'lsp-unavailable:' when LSP
+    isn't installed or no session can serve the request — callers convert
+    that into a graceful "lsp_available: false" envelope rather than an
+    error to the client.
+    """
+    try:
+        from LSP.plugin.core.url import filename_to_uri
+    except ImportError:
+        raise RuntimeError("lsp-unavailable: LSP package not installed")
+
+    params = {
+        "textDocument": {"uri": filename_to_uri(file_path)},
+        "position": {"line": int(row) - 1, "character": int(column) - 1},
+    }
+
+    box = {}
+    done = threading.Event()
+
+    def schedule():
+        try:
+            from LSP.plugin.core.registry import windows
+        except ImportError:
+            box["error"] = "lsp-unavailable: LSP registry not accessible"
+            done.set()
+            return
+
+        sublime_window = sublime.active_window()
+        if sublime_window is None:
+            box["error"] = "lsp-unavailable: no active Sublime window"
+            done.set()
+            return
+
+        try:
+            wm = windows.lookup(sublime_window)
+        except Exception as e:
+            box["error"] = "lsp-unavailable: WindowManager lookup failed: {}".format(e)
+            done.set()
+            return
+        if wm is None:
+            box["error"] = "lsp-unavailable: no LSP WindowManager"
+            done.set()
+            return
+
+        if hasattr(wm, "get_sessions"):
+            sessions = list(wm.get_sessions())
+        elif hasattr(wm, "_sessions"):
+            sessions = list(wm._sessions)
+        else:
+            sessions = []
+        if not sessions:
+            box["error"] = "lsp-unavailable: no LSP sessions in this window"
+            done.set()
+            return
+
+        target = None
+        for s in sessions:
+            try:
+                if hasattr(s, "has_capability") and s.has_capability(capability_key):
+                    target = s
+                    break
+            except Exception:
+                continue
+        if target is None:
+            box["error"] = (
+                "lsp-unavailable: no LSP session advertises '{}'".format(capability_key))
+            done.set()
+            return
+
+        try:
+            req = request_builder(params)
+        except Exception as e:
+            box["error"] = "failed to build LSP request: {}".format(e)
+            done.set()
+            return
+
+        def on_result(result):
+            box["result"] = result
+            done.set()
+
+        def on_error(err):
+            box["error"] = "LSP {} error: {}".format(lsp_method, err)
+            done.set()
+
+        try:
+            target.send_request(req, on_result, on_error)
+        except Exception as e:
+            box["error"] = "LSP send_request failed: {}".format(e)
+            done.set()
+
+    # Schedule the send on the main thread (LSP package isn't reliably
+    # thread-safe). The response callback fires via set_timeout too — we wait
+    # on a background thread, so no deadlock.
+    sublime.set_timeout(schedule, 0)
+
+    if not done.wait(LSP_REQUEST_TIMEOUT):
+        raise RuntimeError(
+            "LSP {} timed out after {}s".format(lsp_method, LSP_REQUEST_TIMEOUT))
+
+    if "error" in box:
+        raise RuntimeError(box["error"])
+
+    return box.get("result")
+
+
+def _lsp_unavailable_envelope(file_path, row, column, message, extra):
+    """Build a successful response carrying the unavailability note instead
+    of raising — matches the pattern get_diagnostics uses so polling clients
+    don't surface a recurring error in their UI."""
+    payload = {
+        "file_path": file_path, "row": row, "column": column,
+        "lsp_available": False,
+        "note": message,
+    }
+    payload.update(extra)
+    return payload
+
+
+def get_definition(file_path: str, row: int, column: int) -> Dict[str, Any]:
+    """Resolve where the symbol at (`row`, `column`) in `file_path` is
+    declared — same as Sublime LSP's 'Go to Definition'.
+
+    Position-based: unlike `find_function_in_project` (name-based, returns
+    every same-named symbol across the project), this uses the language
+    server's scope/import knowledge to give one precise answer.
+
+    Returns: {file_path, row, column, locations: [{file_path, row, column,
+    end_row, end_column}, ...], count, lsp_available}.
+
+    If LSP isn't installed or no session serves the request, returns
+    successfully with empty `locations`, `lsp_available: false`, and a
+    `note` explaining why -- no exception.
+    """
+    try:
+        from LSP.plugin.core.protocol import Request
+    except ImportError:
+        return _lsp_unavailable_envelope(
+            file_path, row, column,
+            "LSP package not installed",
+            {"locations": [], "count": 0})
+
+    try:
+        result = _lsp_position_request_sync(
+            file_path, row, column,
+            lsp_method="textDocument/definition",
+            capability_key="definitionProvider",
+            # The LSP package's Request class has shuffled its class-method
+            # helpers across releases; the constructor (method, params) is
+            # the most version-stable.
+            request_builder=lambda params: Request("textDocument/definition", params),
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if msg.startswith("lsp-unavailable:"):
+            return _lsp_unavailable_envelope(
+                file_path, row, column,
+                msg[len("lsp-unavailable:"):].strip(),
+                {"locations": [], "count": 0})
+        raise
+
+    locations = _parse_lsp_locations(result)
+    return {
+        "file_path": file_path, "row": row, "column": column,
+        "locations": locations, "count": len(locations),
+        "lsp_available": True,
+    }
+
+
+def get_hover(file_path: str, row: int, column: int) -> Dict[str, Any]:
+    """Get LSP hover info -- type signature, docstring, deprecation notes --
+    for the symbol at (`row`, `column`) in `file_path`. Cheaper than
+    `get_function_content` when you only need the signature + docs.
+
+    Returns: {file_path, row, column, contents (markdown string or null),
+    lsp_available}.
+
+    If LSP isn't installed or no session serves the request, returns
+    successfully with `contents: null`, `lsp_available: false`, and a `note`.
+    """
+    try:
+        from LSP.plugin.core.protocol import Request
+    except ImportError:
+        return _lsp_unavailable_envelope(
+            file_path, row, column,
+            "LSP package not installed",
+            {"contents": None})
+
+    try:
+        result = _lsp_position_request_sync(
+            file_path, row, column,
+            lsp_method="textDocument/hover",
+            capability_key="hoverProvider",
+            request_builder=lambda params: Request("textDocument/hover", params),
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if msg.startswith("lsp-unavailable:"):
+            return _lsp_unavailable_envelope(
+                file_path, row, column,
+                msg[len("lsp-unavailable:"):].strip(),
+                {"contents": None})
+        raise
+
+    contents = _parse_lsp_hover(result)
+    return {
+        "file_path": file_path, "row": row, "column": column,
+        "contents": contents,
+        "lsp_available": True,
+    }
+
+
+def _parse_lsp_locations(result):
+    """Normalize textDocument/definition response to our standard shape.
+    The response can be null, a single Location, a list of Locations, or a
+    list of LocationLinks."""
+    if result is None:
+        return []
+    if isinstance(result, dict):
+        result = [result]
+    out = []
+    for loc in result:
+        if not isinstance(loc, dict):
+            continue
+        if "targetUri" in loc:
+            uri = loc.get("targetUri", "")
+            rng = loc.get("targetRange") or {}
+        else:
+            uri = loc.get("uri", "")
+            rng = loc.get("range") or {}
+        start = rng.get("start") or {}
+        end = rng.get("end") or {}
+        out.append({
+            "file_path": _uri_to_filename_safe(uri),
+            "row": int(start.get("line", 0) or 0) + 1,
+            "column": int(start.get("character", 0) or 0) + 1,
+            "end_row": int(end.get("line", 0) or 0) + 1,
+            "end_column": int(end.get("character", 0) or 0) + 1,
+        })
+    return out
+
+
+def _parse_lsp_hover(result):
+    if result is None:
+        return None
+    raw = result.get("contents") if isinstance(result, dict) else result
+    return _flatten_hover_contents(raw)
+
+
+def _flatten_hover_contents(c):
+    """Flatten LSP hover contents (string | MarkedString | MarkedString[] |
+    MarkupContent) into a single markdown string."""
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = [s for s in (_flatten_hover_contents(x) for x in c) if s]
+        return "\n\n---\n\n".join(parts)
+    if isinstance(c, dict) and "value" in c:
+        lang = c.get("language") or c.get("kind")
+        value = c["value"]
+        if lang and lang not in ("markdown", "plaintext"):
+            return "```{}\n{}\n```".format(lang, value)
+        return value
+    return str(c)
+
+
 def get_current_selections() -> Dict[str, Any]:
     """Return the current text selections in the active Sublime view.
 
@@ -2429,6 +2707,8 @@ TOOL_SPECS = [
     (list_functions_in_file, 10.0),
     (get_function_content, 10.0),
     (set_function_content, 15.0),
+    (get_definition, 10.0),
+    (get_hover, 10.0),
 
     # 4. Text search
     (search_text_in_project, 30.0),
